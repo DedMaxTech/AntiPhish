@@ -1,0 +1,16 @@
+{
+  "schema_version": "1.0",
+  "policy": "precision-first",
+  "blocking": {
+    "exact_ioc_codes": ["IOC_SHA256_MATCH", "KNOWN_BAD_URL"],
+    "intent_codes": ["SENSITIVE_FORM"],
+    "recipient_codes": ["EXTERNAL_FORM_ACTION", "SCRIPT_EXFILTRATION"],
+    "mismatch_codes": ["BRAND_DOMAIN_MISMATCH", "DISPLAY_HREF_MISMATCH", "FROM_REPLYTO_MISMATCH", "AUTHENTICATION_FAILURE", "FAKE_DOCUMENT_VIEWER", "QR_EXTERNAL_DESTINATION"]
+  },
+  "suspicious": {
+    "single_high_codes": ["SENSITIVE_FORM", "DANGEROUS_ATTACHMENT", "OFFICE_MACRO", "PDF_ACTIVE_CONTENT", "FAKE_DOCUMENT_VIEWER", "BRAND_DOMAIN_MISMATCH", "HIDDEN_REDIRECT", "CREDENTIAL_LURE", "ACTIVE_CLOAKING", "OBFUSCATED_LURE_SCRIPT", "MAILBOX_REVIEW_LURE", "LOGIN_IFRAME", "FINANCIAL_LOGIN_LURE"],
+    "minimum_medium_independent_groups": 2
+  },
+  "model_can_block": false,
+  "partial_analysis_can_block_without_exact_ioc": false
+}

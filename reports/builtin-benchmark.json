@@ -1,0 +1,112 @@
+{
+  "benchmark": "built-in-regression-fixtures",
+  "evidence_scope": "synthetic regression only; not an external effectiveness claim",
+  "samples": 8,
+  "confusion": {
+    "phishing_detected": 3,
+    "phishing_missed": 0,
+    "benign_phishing": 0,
+    "benign_suspicious": 1,
+    "benign_not_detected": 4
+  },
+  "metrics": {
+    "phishing_plus_suspicious_recall": 1.0,
+    "phishing_block_recall": 1.0,
+    "observed_block_fpr": 0.0,
+    "block_fpr_per_million": 0.0,
+    "zero_fp_95pct_upper_bound": 0.4507197283469412
+  },
+  "rows": [
+    {
+      "name": "corporate-invoice.eml",
+      "label": "benign",
+      "verdict": "NOT_DETECTED",
+      "analysis_status": "COMPLETE",
+      "reason_codes": [
+        "BEC_PAYMENT_REQUEST"
+      ],
+      "correct": true
+    },
+    {
+      "name": "password-policy.html",
+      "label": "benign",
+      "verdict": "NOT_DETECTED",
+      "analysis_status": "COMPLETE",
+      "reason_codes": [],
+      "correct": true
+    },
+    {
+      "name": "newsletter.html",
+      "label": "benign",
+      "verdict": "NOT_DETECTED",
+      "analysis_status": "COMPLETE",
+      "reason_codes": [],
+      "correct": true
+    },
+    {
+      "name": "login-demo.html",
+      "label": "benign",
+      "verdict": "SUSPICIOUS",
+      "analysis_status": "COMPLETE",
+      "reason_codes": [
+        "SENSITIVE_FORM"
+      ],
+      "correct": false
+    },
+    {
+      "name": "forwarded.eml",
+      "label": "benign",
+      "verdict": "NOT_DETECTED",
+      "analysis_status": "COMPLETE",
+      "reason_codes": [
+        "FROM_REPLYTO_MISMATCH"
+      ],
+      "correct": true
+    },
+    {
+      "name": "unknown-brand-credential.html",
+      "label": "phishing",
+      "verdict": "PHISHING",
+      "analysis_status": "COMPLETE",
+      "reason_codes": [
+        "DISPLAY_HREF_MISMATCH",
+        "SENSITIVE_FORM",
+        "EXTERNAL_FORM_ACTION",
+        "REMOTE_FORM_SUBMISSION",
+        "SCRIPT_EXFILTRATION"
+      ],
+      "correct": true
+    },
+    {
+      "name": "sber-fake.html",
+      "label": "phishing",
+      "verdict": "PHISHING",
+      "analysis_status": "COMPLETE",
+      "reason_codes": [
+        "SENSITIVE_FORM",
+        "EXTERNAL_FORM_ACTION",
+        "REMOTE_FORM_SUBMISSION",
+        "SCRIPT_EXFILTRATION",
+        "BRAND_DOMAIN_MISMATCH"
+      ],
+      "correct": true
+    },
+    {
+      "name": "fake-viewer.html",
+      "label": "phishing",
+      "verdict": "PHISHING",
+      "analysis_status": "COMPLETE",
+      "reason_codes": [
+        "SENSITIVE_FORM",
+        "EXTERNAL_FORM_ACTION",
+        "REMOTE_FORM_SUBMISSION",
+        "SCRIPT_EXFILTRATION",
+        "FAKE_DOCUMENT_VIEWER",
+        "DOCUMENT_ACCESS_LURE",
+        "BRAND_DOMAIN_MISMATCH"
+      ],
+      "correct": true
+    }
+  ],
+  "duration_ms": 137.65
+}

@@ -1,0 +1,25 @@
+{
+  "status": "OK",
+  "case_dir": "Кейс_2",
+  "html_zip": "html_phishing.zip",
+  "brand_zip": "target_brands.zip",
+  "brand_zip_diagnosis": "DAMAGED_OR_EMPTY_PAYLOAD",
+  "stats": {
+    "html_files": 7642,
+    "png_files": 2854,
+    "other_files": 0,
+    "html_bytes": 1041168048,
+    "png_bytes": 266925481,
+    "long_path_png": 86,
+    "target_brand_entries": 1489,
+    "target_brand_files": 0,
+    "target_brand_names": 175,
+    "target_brand_raw_names": 176,
+    "unique_sha256": 9913,
+    "duplicate_objects": 583,
+    "fingerprint_records": 10496,
+    "fingerprint_extraction_errors": 0
+  },
+  "knowledge_base": "knowledge.sqlite",
+  "built_at": "2026-09-04T09:08:51Z"
+}

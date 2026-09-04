@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+.coverage
+htmlcov/
+.idea/
+.vscode/
+*.log
+*.tmp
+models/Qwen3.5-4B/
+models/siglip2-base-patch16-224/
+reports/external-*.json

