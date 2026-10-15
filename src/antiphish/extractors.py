@@ -8,6 +8,7 @@ import io
 import json
 import re
 import zipfile
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from email import policy
 from email.message import Message
@@ -19,7 +20,7 @@ from lxml import etree, html
 from PIL import Image
 
 from .config import Limits
-from .models import AttachmentFinding, Evidence, Severity, UrlFinding
+from .models import AttachmentFinding, Evidence, PageFinding, Severity, UrlFinding
 from .urltools import extract_urls, normalize_url, same_site
 from .utils import bounded_text, sha256_bytes, simhash64
 
@@ -52,6 +53,7 @@ GENERIC_LOGIN_TERMS = re.compile(r"(?i)(?:login|log in|sign in|password|passwort
 MAILBOX_LURE = re.compile(r"(?is)(?:message|email|mail|письм).{0,100}(?:blocked|hold|quarantine|restriction|failure|заблок|карантин|приостанов).{0,180}(?:review|resolve|release|move|просмотр|восстанов|разреш)")
 FINANCIAL_LOGIN = re.compile(r"(?is)(?:bank|credit union|банк|финанс).{0,250}(?:login|log in|sign in|online banking|личн.{0,15}кабинет|войти)")
 AUTH_FAIL = re.compile(r"(?i)\b(?:spf|dkim|dmarc)=(?:fail|softfail|permerror|temperror)\b")
+_EXTRACTED_BYTES = ContextVar("antiphish_extracted_bytes", default=None)
 
 
 @dataclass(slots=True)
@@ -62,6 +64,7 @@ class Extracted:
     text: str = ""
     html_text: str = ""
     urls: list[UrlFinding] = field(default_factory=list)
+    pages: list[PageFinding] = field(default_factory=list)
     attachments: list[AttachmentFinding] = field(default_factory=list)
     evidence: list[Evidence] = field(default_factory=list)
     fingerprints: dict[str, Any] = field(default_factory=dict)
@@ -74,8 +77,12 @@ def _evidence(code: str, severity: Severity, summary: str, group: str, **details
 
 
 def _append_url(result: Extracted, raw: str, source: str, displayed: str | None = None) -> None:
+    if len(result.urls) >= result.metadata.get("max_urls", 500):
+        if "URL count limit reached" not in result.warnings:
+            result.warnings.append("URL count limit reached")
+        return
     try:
-        item = normalize_url(html_module.unescape(raw))
+        item = normalize_url(raw)
     except (ValueError, UnicodeError):
         return
     finding = UrlFinding(
@@ -87,9 +94,11 @@ def _append_url(result: Extracted, raw: str, source: str, displayed: str | None 
         displayed_text=bounded_text(displayed or "", 200) or None,
         source=source,
         flags=list(item.flags),
+        navigation_url=item.normalized,
+        scope_id=result.metadata.get("scope_id"),
     )
-    key = (finding.normalized, source, finding.displayed_text)
-    if not any((u.normalized, u.source, u.displayed_text) == key for u in result.urls):
+    key = (finding.navigation_url, source, finding.displayed_text)
+    if not any((u.navigation_url, u.source, u.displayed_text) == key for u in result.urls):
         result.urls.append(finding)
     risky = {"MIXED_SCRIPT_HOST", "IP_LITERAL", "USERINFO_IN_URL", "NON_STANDARD_PORT"}.intersection(item.flags)
     if risky:
@@ -100,157 +109,12 @@ def _append_url(result: Extracted, raw: str, source: str, displayed: str | None 
         result.evidence.append(_evidence("TOKENIZED_ACTION_URL", Severity.MEDIUM, "Ссылка содержит токен действия", "url", url=item.redacted))
 
 
-def extract_html(data: bytes, limits: Limits, base_url: str | None = None) -> Extracted:
-    result = Extracted(kind="html", sha256=sha256_bytes(data), size=len(data))
-    if len(data) > limits.max_input_bytes:
-        result.warnings.append("HTML exceeds configured input limit and was truncated")
-        data = data[: limits.max_input_bytes]
-    decoded = _decode_html(data)
-    parser = html.HTMLParser(recover=True, no_network=True, huge_tree=False)
-    try:
-        root = html.fromstring(decoded, parser=parser, base_url=base_url)
-    except (etree.ParserError, ValueError, LookupError, UnicodeError) as exc:
-        text = decoded
-        result.text = bounded_text(re.sub(r"<[^>]+>", " ", text), limits.max_text_chars)
-        result.warnings.append(f"HTML parser recovered as plain text: {type(exc).__name__}")
-        for url in extract_urls(text)[: limits.max_urls]:
-            _append_url(result, url, "html-raw")
-        return result
-
-    for bad in root.xpath("//script|//style|//noscript"):
-        if bad.tag != "script":
-            bad.drop_tree()
-    visible = " ".join(root.xpath("//text()[not(ancestor::script) and not(ancestor::style)]"))
-    result.text = bounded_text(re.sub(r"\s+", " ", visible).strip(), limits.max_text_chars)
-    scripts = "\n".join(root.xpath("//script/text()"))
-
-    for attr in ("href", "src", "action", "data", "poster"):
-        for node in root.xpath(f"//*[@{attr}]")[: limits.max_urls]:
-            value = node.get(attr, "").strip()
-            if not value:
-                continue
-            absolute = urljoin(base_url, value) if base_url else value
-            if absolute.lower().startswith(("http://", "https://")):
-                tag = node.tag.lower() if isinstance(node.tag, str) else "unknown"
-                displayed = " ".join(node.itertext()).strip() if attr == "href" and tag in {"a", "area"} else None
-                _append_url(result, absolute, f"html:{tag}:{attr}", displayed)
-
-    for url in extract_urls(scripts)[: limits.max_urls]:
-        _append_url(result, url, "javascript")
-
-    for anchor in root.xpath("//a[@href]"):
-        display_urls = extract_urls(" ".join(anchor.itertext()))
-        if not display_urls:
-            continue
-        try:
-            shown = normalize_url(display_urls[0])
-            target = normalize_url(urljoin(base_url, anchor.get("href")) if base_url else anchor.get("href"))
-            if not same_site(shown.host, target.host):
-                result.evidence.append(_evidence(
-                    "DISPLAY_HREF_MISMATCH", Severity.HIGH,
-                    "Показанный домен ссылки отличается от адреса перехода", "link",
-                    displayed=shown.redacted, destination=target.redacted,
-                ))
-        except (ValueError, TypeError):
-            pass
-
-    sensitive_forms = 0
-    remote_forms = 0
-    for index, form in enumerate(root.xpath("//form")[: limits.max_forms]):
-        fields = [x for x in form.xpath(".//input|.//textarea|.//select") if x.get("type", "").lower() not in {"hidden", "submit", "button"}]
-        sensitive = []
-        for node in fields:
-            descriptor = " ".join(filter(None, [node.get("name"), node.get("id"), node.get("placeholder"), node.get("autocomplete"), node.get("type")]))
-            if node.get("type", "").lower() == "password" or SENSITIVE_NAMES.search(descriptor):
-                sensitive.append(bounded_text(descriptor, 120))
-        if not sensitive:
-            continue
-        sensitive_forms += 1
-        action_raw = urljoin(base_url, form.get("action", "")) if base_url else form.get("action", "")
-        result.evidence.append(_evidence(
-            "SENSITIVE_FORM", Severity.HIGH, "Форма запрашивает чувствительные данные", "intent",
-            form_index=index, fields=sensitive[:10], method=form.get("method", "get").lower(),
-        ))
-        if action_raw.lower().startswith(("http://", "https://")):
-            remote_forms += 1
-            _append_url(result, action_raw, "form-action")
-            try:
-                action = normalize_url(action_raw)
-                page = normalize_url(base_url) if base_url else None
-                if page is None or not same_site(page.host, action.host):
-                    result.evidence.append(_evidence(
-                        "EXTERNAL_FORM_ACTION", Severity.HIGH,
-                        "Чувствительные данные отправляются на внешний домен", "recipient",
-                        destination=action.redacted, form_index=index,
-                    ))
-            except ValueError:
-                pass
-
-    # Remote forms without visible fields are common document-delivery lures:
-    # the hidden identifiers select a victim and the next stage asks for secrets.
-    for form in root.xpath("//form[@action]")[: limits.max_forms]:
-        action = urljoin(base_url, form.get("action", "")) if base_url else form.get("action", "")
-        if action.lower().startswith(("http://", "https://")) and not any(u.source == "form-action" and u.original.startswith(action.split("?", 1)[0]) for u in result.urls):
-            remote_forms += 1
-            _append_url(result, action, "form-action")
-    if remote_forms:
-        result.evidence.append(_evidence("REMOTE_FORM_SUBMISSION", Severity.MEDIUM, "HTML-форма отправляется на абсолютный удалённый URL", "recipient", count=remote_forms))
-
-    if sensitive_forms and EXFIL_JS.search(scripts):
-        result.evidence.append(_evidence(
-            "SCRIPT_EXFILTRATION", Severity.HIGH,
-            "Скрипт формы использует сетевую отправку данных", "recipient",
-            api=EXFIL_JS.search(scripts).group(0)[:40],
-        ))
-    if REDIRECT_JS.search(scripts):
-        result.evidence.append(_evidence("HIDDEN_REDIRECT", Severity.MEDIUM, "Обнаружен автоматический JavaScript-редирект", "redirect"))
-    for meta in root.xpath("//meta[translate(@http-equiv,'REFSH','refsh')='refresh']"):
-        content = meta.get("content", "")
-        result.evidence.append(_evidence("HIDDEN_REDIRECT", Severity.MEDIUM, "Обнаружен meta refresh", "redirect", content=bounded_text(content, 200)))
-        match = re.search(r"(?i)url\s*=\s*['\"]?([^'\";]+)", content)
-        if match:
-            _append_url(result, urljoin(base_url, match.group(1)) if base_url else match.group(1), "meta-refresh")
-
-    if sensitive_forms and VIEWER_TERMS.search(result.text):
-        result.evidence.append(_evidence(
-            "FAKE_DOCUMENT_VIEWER", Severity.HIGH,
-            "Страница имитирует просмотр документа и запрашивает секрет", "lure",
-        ))
-    if PASSWORD_LURE.search(result.text) and result.urls:
-        result.evidence.append(_evidence("CREDENTIAL_LURE", Severity.HIGH, "Текст побуждает подтвердить, сохранить или обновить пароль", "lure"))
-    if DOCUMENT_LURE.search(result.text):
-        result.evidence.append(_evidence("DOCUMENT_ACCESS_LURE", Severity.MEDIUM, "Использован сценарий доступа к защищённому или общему документу", "lure"))
-    raw_decoded = decoded
-    if ANTIBOT_TERMS.search(raw_decoded) and (EXFIL_JS.search(scripts) or REDIRECT_JS.search(scripts)):
-        result.evidence.append(_evidence("ACTIVE_CLOAKING", Severity.HIGH, "Антибот-проверка совмещена с активным сетевым кодом или редиректом", "evasion"))
-    if OBFUSCATED_JS.search(scripts) and GENERIC_LOGIN_TERMS.search(raw_decoded) and result.urls:
-        result.evidence.append(_evidence("OBFUSCATED_LURE_SCRIPT", Severity.HIGH, "Форма входа или проверки содержит обфусцированный JavaScript", "evasion"))
-    if MAILBOX_LURE.search(result.text) and result.urls:
-        result.evidence.append(_evidence("MAILBOX_REVIEW_LURE", Severity.HIGH, "Сообщение требует проверить или освободить якобы заблокированную почту", "lure"))
-    if root.xpath("//iframe") and GENERIC_LOGIN_TERMS.search(result.text):
-        result.evidence.append(_evidence("LOGIN_IFRAME", Severity.HIGH, "Сценарий входа загружается через iframe", "lure"))
-    if FINANCIAL_LOGIN.search(result.text) and result.urls:
-        result.evidence.append(_evidence("FINANCIAL_LOGIN_LURE", Severity.HIGH, "Неподтверждённая банковская страница предлагает вход", "lure"))
-
-    tag_tokens = []
-    for node in root.iter():
-        if not isinstance(node.tag, str):
-            continue
-        tag_tokens.append(f"{node.tag.lower()}:{','.join(sorted(k.lower() for k in node.attrib if not k.lower().startswith('data-')))}")
-    structure = "|".join(tag_tokens)
-    result.fingerprints.update({
-        "sha256": result.sha256,
-        "dom_sha256": hashlib.sha256(structure.encode()).hexdigest(),
-        "dom_simhash64": simhash64(tag_tokens),
-        "js_api_simhash64": simhash64(re.findall(r"[A-Za-z_$][\w$]{2,}", scripts)),
-        "form_count": len(root.xpath("//form")),
-        "sensitive_form_count": sensitive_forms,
-    })
-    result.html_text = bounded_text(decoded, limits.max_text_chars)
-    return result
+def extract_html(data: bytes, limits: Limits, base_url: str | None = None, encoding: str | None = None) -> Extracted:
+    from .htmlanalysis import extract_html as parse_html
+    return parse_html(data, limits, base_url, encoding)
 
 
-def _decode_html(data: bytes) -> str:
+def _decode_html(data: bytes, declared_encoding: str | None = None) -> str:
     head = data[:4096]
     bom_encodings = []
     if data.startswith(b"\xef\xbb\xbf"):
@@ -258,12 +122,12 @@ def _decode_html(data: bytes) -> str:
     elif data.startswith((b"\xff\xfe", b"\xfe\xff")):
         bom_encodings.append("utf-16")
     charset = re.search(rb"(?i)charset\s*=\s*['\"]?\s*([A-Za-z0-9._-]+)", head)
-    candidates = bom_encodings + ([charset.group(1).decode("ascii", "ignore")] if charset else []) + ["utf-8", "cp1251", "windows-1252", "latin-1"]
+    candidates = bom_encodings + ([declared_encoding] if declared_encoding else []) + ([charset.group(1).decode("ascii", "ignore")] if charset else []) + ["utf-8", "cp1251", "windows-1252", "latin-1"]
     for encoding in dict.fromkeys(candidates):
         try:
             text = data.decode(encoding)
             # lxml rejects encoding declarations on Unicode input.
-            return re.sub(r"(?is)^\s*<\?xml[^>]*encoding\s*=\s*['\"][^'\"]+['\"][^>]*\?>", "", text)
+            return repair_mojibake(re.sub(r"(?is)^\s*<\?xml[^>]*encoding\s*=\s*['\"][^'\"]+['\"][^>]*\?>", "", text))
         except (UnicodeDecodeError, LookupError):
             continue
     return data.decode("utf-8", "replace")
@@ -272,7 +136,9 @@ def _decode_html(data: bytes) -> str:
 def extract_eml(data: bytes, limits: Limits, depth: int = 0, quality: bool = True) -> Extracted:
     result = Extracted(kind="eml", sha256=sha256_bytes(data), size=len(data))
     try:
-        msg = email.message_from_bytes(data, policy=policy.default)
+        # Captured messages sometimes contain CRCRLF. Keep original bytes for
+        # hashing, but repair this transport artefact before MIME parsing.
+        msg = email.message_from_bytes(data.replace(b"\r\r\n", b"\r\n"), policy=policy.default)
     except Exception as exc:
         result.warnings.append(f"Malformed MIME: {type(exc).__name__}")
         result.text = bounded_text(data.decode("utf-8", "replace"), limits.max_text_chars)
@@ -292,35 +158,53 @@ def extract_eml(data: bytes, limits: Limits, depth: int = 0, quality: bool = Tru
         result.evidence.append(_evidence("AUTHENTICATION_FAILURE", Severity.MEDIUM, "Заголовки сообщают об ошибке SPF/DKIM/DMARC", "sender", result=bounded_text(headers.get("authentication-results", ""), 500)))
 
     plain_parts: list[str] = []
-    html_parts: list[bytes] = []
-    for part in msg.walk():
-        if part.is_multipart():
+    html_parts: list[tuple[bytes, str | None]] = []
+    for part in _leaf_parts(msg):
+        if part.get_content_type() == "message/rfc822":
+            children = part.get_payload()
+            if isinstance(children,list):
+                for child_message in children:
+                    payload = child_message.as_bytes(policy=policy.default)
+                    child = extract_any(payload,part.get_filename() or "forwarded.eml","message/rfc822",limits,depth+1,quality=quality)
+                    result.attachments.append(AttachmentFinding(part.get_filename() or "forwarded.eml","message/rfc822",len(payload),sha256_bytes(payload),"PARTIAL" if child.warnings else "ANALYZED",sorted({e.code for e in child.evidence})))
+                    result.attachments.extend(child.attachments)
+                    result.pages.extend(child.pages)
+                    result.urls.extend(child.urls)
+                    result.evidence.extend(child.evidence)
+                    result.warnings.extend(child.warnings)
+                    plain_parts.append(child.text)
             continue
         payload = part.get_payload(decode=True) or b""
         if len(payload) > limits.max_attachment_bytes:
             result.warnings.append(f"Part {part.get_filename() or part.get_content_type()} exceeds size limit")
             continue
         ctype = part.get_content_type().lower()
+        if ctype in {"application/pkcs7-mime","application/x-pkcs7-mime","application/pgp-encrypted"}:
+            result.warnings.append("Encrypted email content cannot be inspected without decryption")
         disposition = part.get_content_disposition()
         filename = part.get_filename()
         if ctype == "text/plain" and disposition != "attachment":
             plain_parts.append(_decode_part(payload, part))
         elif ctype == "text/html" and disposition != "attachment":
-            html_parts.append(payload)
-        elif filename or disposition == "attachment":
+            html_parts.append((payload, part.get_content_charset()))
+        elif filename or disposition == "attachment" or ctype.startswith("image/"):
             name = bounded_text(filename or f"part-{len(result.attachments)+1}", 240)
             child = extract_any(payload, name, ctype, limits, depth + 1, quality=quality)
             finding = AttachmentFinding(name=name, media_type=ctype, size=len(payload), sha256=sha256_bytes(payload), status="PARTIAL" if child.warnings else "ANALYZED", evidence_codes=sorted({e.code for e in child.evidence}))
             result.attachments.append(finding)
             result.urls.extend(child.urls)
+            result.pages.extend(child.pages)
             result.evidence.extend(child.evidence)
+            result.attachments.extend(child.attachments)
+            plain_parts.append(child.text)
             result.warnings.extend(f"Attachment {name}: {w}" for w in child.warnings)
     result.text = bounded_text("\n".join(plain_parts), limits.max_text_chars)
-    for body in html_parts:
-        child = extract_html(body, limits)
+    for body, encoding in html_parts:
+        child = extract_html(body, limits, encoding=encoding)
         result.text = bounded_text(result.text + "\n" + child.text, limits.max_text_chars)
         result.html_text = bounded_text(result.html_text + "\n" + child.html_text, limits.max_text_chars)
         result.urls.extend(child.urls)
+        result.pages.extend(child.pages)
         result.evidence.extend(child.evidence)
         result.fingerprints.setdefault("html_parts", []).append(child.fingerprints)
         result.warnings.extend(child.warnings)
@@ -332,14 +216,61 @@ def extract_eml(data: bytes, limits: Limits, depth: int = 0, quality: bool = Tru
     return result
 
 
+def _leaf_parts(message):
+    stack = [message]
+    while stack:
+        part = stack.pop()
+        if part.get_content_type() == "message/rfc822" or not part.is_multipart():
+            yield part
+        else:
+            stack.extend(reversed(part.get_payload() or []))
+
+
 def _decode_part(payload: bytes, part: Message) -> str:
     for charset in (part.get_content_charset(), "utf-8", "cp1251", "latin-1"):
         if charset:
             try:
-                return payload.decode(charset)
+                return repair_mojibake(payload.decode(charset))
             except (UnicodeDecodeError, LookupError):
                 continue
     return payload.decode("utf-8", "replace")
+
+
+def repair_mojibake(text: str) -> str:
+    pattern = re.compile(r"[ÐÑ][^\x00-\x7f]|[РС][\u0400-\u04ff]")
+    before = len(pattern.findall(text))
+    if before < 5:
+        return text
+    for encoding in ("latin-1", "cp1251"):
+        try:
+            repaired = text.encode(encoding).decode("utf-8")
+        except (UnicodeError, LookupError):
+            continue
+        if len(pattern.findall(repaired)) < before / 2:
+            return repaired
+    # A corrupt block can coexist with correctly encoded Russian text. Repair
+    # only Latin-1 runs that round-trip and substantially reduce the markers.
+    def repair_run(match):
+        value = match.group(0)
+        old = len(pattern.findall(value))
+        if old < 5:
+            return value
+        try:
+            candidate = value.encode("latin-1").decode("utf-8")
+            return candidate if len(pattern.findall(candidate)) < old/2 else value
+        except UnicodeError:
+            return value
+    text = re.sub(r"[\x09\x0a\x0d\x20-\xff]+", repair_run, text)
+    # Damage elsewhere in a block can break the whole UTF-8 round trip. Still
+    # recover complete Cyrillic words without guessing the missing bytes.
+    def repair_sequences(match):
+        value = match.group(0)
+        try:
+            candidate = value.encode("latin-1").decode("utf-8")
+            return candidate if re.search(r"[А-Яа-яЁё]",candidate) else value
+        except UnicodeError:
+            return value
+    return re.sub(r"(?:[\xc2-\xdf][\x80-\xbf]|[\xe0-\xef][\x80-\xbf]{2}|[\xf0-\xf4][\x80-\xbf]{3})+",repair_sequences,text)
 
 
 def _address_domain(value: str) -> str | None:
@@ -350,11 +281,23 @@ def _address_domain(value: str) -> str | None:
 def extract_pdf(data: bytes, limits: Limits, quality: bool = True) -> Extracted:
     result = Extracted(kind="pdf", sha256=sha256_bytes(data), size=len(data))
     try:
-        import fitz
+        import pymupdf as fitz
         doc = fitz.open(stream=data, filetype="pdf")
+        from .active import pdf_actions
+        actions, scripts, active_warnings = pdf_actions(doc, limits)
+        result.warnings.extend(active_warnings)
+        result.fingerprints['pdf_actions'] = actions
+        if actions:
+            result.evidence.append(_evidence('PDF_ACTIVE_CONTENT', Severity.HIGH, 'PDF содержит структурно обнаруженные действия или вложенные объекты', 'attachment', features=sorted({a['type'] for a in actions}), objects=actions))
+        for script in scripts:
+            for url in extract_urls(script)[:limits.max_urls]:
+                _append_url(result, url, 'pdf:active-action')
+        if any(a['type'] in {'Launch', 'ImportData'} or {'secret_field_read', 'network_submission'} <= set(a.get('script', {}).get('features', [])) for a in actions):
+            result.evidence.append(_evidence('ACTIVE_PAYLOAD_BEHAVIOR', Severity.HIGH, 'Активный PDF запускает программу или передаёт данные формы', 'attachment', executed=False))
         texts: list[str] = []
+        image_count = 0
         for page_index, page in enumerate(doc):
-            if page_index >= limits.max_pages:
+            if page_index >= min(limits.max_pdf_pages, limits.max_pages):
                 result.warnings.append("PDF page limit reached")
                 break
             texts.append(page.get_text("text"))
@@ -369,27 +312,25 @@ def extract_pdf(data: bytes, limits: Limits, quality: bool = True) -> Extracted:
                     sensitive_widgets.append(bounded_text(descriptor, 120))
             if sensitive_widgets:
                 result.evidence.append(_evidence("SENSITIVE_FORM", Severity.HIGH, "PDF-форма запрашивает чувствительные данные", "intent", page=page_index + 1, fields=sensitive_widgets[:10]))
-            embedded_images = page.get_images(full=True)[: limits.max_images_per_document] if quality else []
+            scanned = quality and image_count < limits.max_images_per_document and len(texts[-1].strip()) < 40
+            if scanned:
+                scale = min(2, 1800 / max(page.rect.width, page.rect.height, 1))
+                pixmap = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
+                _merge_image(result, pixmap.tobytes("png"), f"pdf:scan-page-{page_index+1}")
+                image_count += 1
+            embedded_images = page.get_images(full=True)[: max(0, limits.max_images_per_document - image_count)] if quality and not scanned else []
             for image in embedded_images:
                 try:
                     blob = doc.extract_image(image[0])["image"]
                     _merge_image(result, blob, f"pdf:image-page-{page_index+1}")
+                    image_count += 1
                 except Exception:
                     continue
-        result.text = bounded_text("\n".join(texts), limits.max_text_chars)
+        result.text = bounded_text("\n".join(texts) + "\n" + result.text, limits.max_text_chars)
         result.metadata["page_count"] = doc.page_count
         doc.close()
     except Exception as exc:
         result.warnings.append(f"PDF parsing failed: {type(exc).__name__}")
-    active_patterns = {
-        "JavaScript": rb"/JavaScript|/JS\b",
-        "Launch": rb"/Launch\b",
-        "EmbeddedFile": rb"/EmbeddedFile\b",
-        "OpenAction": rb"/OpenAction\b",
-    }
-    active = [name for name, pattern in active_patterns.items() if re.search(pattern, data)]
-    if active:
-        result.evidence.append(_evidence("PDF_ACTIVE_CONTENT", Severity.HIGH, "PDF содержит активное или встроенное содержимое", "attachment", features=active))
     for url in extract_urls(result.text)[: limits.max_urls]:
         _append_url(result, url, "pdf:text")
     result.fingerprints["sha256"] = result.sha256
@@ -398,6 +339,7 @@ def extract_pdf(data: bytes, limits: Limits, quality: bool = True) -> Extracted:
 
 def extract_office(data: bytes, name: str, limits: Limits) -> Extracted:
     result = Extracted(kind="office", sha256=sha256_bytes(data), size=len(data))
+    macro_data = []
     if data.startswith(b"PK"):
         try:
             with zipfile.ZipFile(io.BytesIO(data)) as archive:
@@ -415,6 +357,8 @@ def extract_office(data: bytes, name: str, limits: Limits) -> Extracted:
                     lower = info.filename.lower()
                     if "vbaproject.bin" in lower:
                         macros.append(info.filename)
+                        if info.file_size <= limits.max_attachment_bytes:
+                            macro_data.append((archive.read(info), info.filename))
                     if lower.endswith((".xml", ".rels")) and info.file_size <= limits.max_xml_bytes:
                         blob = archive.read(info)
                         if b"<!DOCTYPE" in blob.upper() or b"<!ENTITY" in blob.upper():
@@ -438,10 +382,23 @@ def extract_office(data: bytes, name: str, limits: Limits) -> Extracted:
         except (zipfile.BadZipFile, ValueError, RuntimeError) as exc:
             result.warnings.append(f"OOXML parsing stopped: {exc}")
     else:
+        if data.startswith(bytes.fromhex('d0cf11e0a1b11ae1')):
+            macro_data.append((data, name))
         if b"VBA" in data or b"AutoOpen" in data or b"Document_Open" in data:
             result.evidence.append(_evidence("OFFICE_MACRO", Severity.HIGH, "OLE-документ содержит признаки макроса", "attachment"))
         for url in extract_urls(data.decode("latin-1", "ignore"))[: limits.max_urls]:
             _append_url(result, url, "office:ole")
+    if macro_data:
+        from .active import vba_facts
+        for blob, macro_name in macro_data[:10]:
+            observations, scripts, warnings = vba_facts(blob, macro_name)
+            result.fingerprints.setdefault('vba_modules', []).extend(observations)
+            result.warnings.extend(warnings)
+            if observations and not any(e.code == 'OFFICE_MACRO' for e in result.evidence):
+                result.evidence.append(_evidence('OFFICE_MACRO', Severity.HIGH, 'Извлечён VBA-код', 'attachment', module_count=len(observations)))
+            for code in scripts:
+                for url in extract_urls(code)[:limits.max_urls]:
+                    _append_url(result, url, 'office:vba')
     for url in extract_urls(result.text)[: limits.max_urls]:
         _append_url(result, url, "office:text")
     result.fingerprints["sha256"] = result.sha256
@@ -457,29 +414,45 @@ def extract_image(data: bytes, limits: Limits, quality: bool = True) -> Extracte
 
 def _merge_image(result: Extracted, data: bytes, source: str, decode_qr: bool = True) -> None:
     try:
-        image = Image.open(io.BytesIO(data)).convert("RGB")
+        original = Image.open(io.BytesIO(data))
+        if original.width * original.height > 30_000_000:
+            result.warnings.append("Image analysis skipped due to pixel limit")
+            return
+        image = original.convert("RGB")
         result.fingerprints.setdefault("image_phash", []).append(_phash(image))
         if not decode_qr:
             return
+        from .ocr import recognize
+        text, ocr_status = recognize(image)
+        result.metadata.setdefault("ocr", []).append({"source": source, "status": ocr_status})
+        if ocr_status in {"UNAVAILABLE", "LIMITED"} or ocr_status.startswith("FAILED:"):
+            warning = "Image text inspection: " + ocr_status
+            if warning not in result.warnings:
+                result.warnings.append(warning)
+        if text:
+            digest = sha256_bytes(data)
+            scope = "image:" + digest[:20]
+            page = PageFinding(scope, digest, title=" ".join(text.splitlines()[:3])[:240], text=text, identity_text=text[:1200], identity_source="ocr")
+            result.pages.append(page)
+            result.text = bounded_text(result.text + "\n" + text, 2_000_000)
+            result.evidence.append(Evidence("OCR_TEXT_EXTRACTED", Severity.INFO, "Распознан текст изображения локальной моделью с кириллицей", {"source": source, "characters": len(text), "blocking": False}, independent_group="visual", scope_id=scope))
+            old_scope = result.metadata.get("scope_id")
+            result.metadata["scope_id"] = scope
+            for url in extract_urls(text)[:50]:
+                _append_url(result, url, "ocr:text")
+            result.metadata["scope_id"] = old_scope
         if image.width * image.height > 30_000_000:
             result.warnings.append("Image QR scan skipped due to pixel limit")
             return
-        import cv2
-        import numpy as np
-        array = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
-        detector = cv2.QRCodeDetector()
-        decoded: list[str] = []
-        try:
-            ok, values, _points, _ = detector.detectAndDecodeMulti(array)
-            if ok:
-                decoded.extend(v for v in values if v)
-        except cv2.error:
-            value, _points, _ = detector.detectAndDecode(array)
-            if value:
-                decoded.append(value)
+        from .qr import decode
+        decoded = decode(image)
         for value in decoded[:20]:
             if value.lower().startswith(("http://", "https://")):
+                old_scope = result.metadata.get("scope_id")
+                if text:
+                    result.metadata["scope_id"] = scope
                 _append_url(result, value, f"qr:{source}")
+                result.metadata["scope_id"] = old_scope
                 result.evidence.append(_evidence("QR_EXTERNAL_DESTINATION", Severity.MEDIUM, "QR-код содержит веб-адрес", "qr", destination=normalize_url(value).redacted))
     except Exception as exc:
         result.warnings.append(f"Image analysis failed: {type(exc).__name__}")
@@ -501,13 +474,24 @@ def _phash(image: Image.Image) -> str:
 
 
 def extract_any(data: bytes, name: str, media_type: str | None, limits: Limits, depth: int = 0, quality: bool = True) -> Extracted:
+    if len(data) > limits.max_input_bytes:
+        raise ValueError("Input exceeds byte limit")
+    if depth == 0:
+        _EXTRACTED_BYTES.set([len(data)])
+    else:
+        budget = _EXTRACTED_BYTES.get()
+        if budget is not None:
+            budget[0] += len(data)
+            if budget[0] > limits.max_total_extracted_bytes:
+                return Extracted(kind="unknown", sha256=sha256_bytes(data), size=len(data), warnings=["Total extraction byte budget reached"])
     if depth > limits.max_recursion_depth:
         result = Extracted(kind="unknown", sha256=sha256_bytes(data), size=len(data))
         result.warnings.append("Recursion depth limit reached")
         return result
     lower = name.lower()
     ctype = (media_type or "").lower()
-    if lower.endswith(".eml") or ctype == "message/rfc822" or (b"MIME-Version:" in data[:4096] and b"From:" in data[:4096]):
+    header = data[:65536].replace(b"\r\r\n", b"\r\n").split(b"\n\n", 1)[0]
+    if lower.endswith(".eml") or ctype == "message/rfc822" or (re.search(rb"(?im)^From:", header) and re.search(rb"(?im)^(?:Subject|MIME-Version|Received|To):", header)):
         return extract_eml(data, limits, depth, quality=quality)
     if lower.endswith((".html", ".htm")) or "html" in ctype or re.search(rb"(?is)^\s*(?:<!doctype\s+html|<html|<head|<body)", data[:4096]):
         return extract_html(data, limits)
@@ -515,6 +499,8 @@ def extract_any(data: bytes, name: str, media_type: str | None, limits: Limits, 
         return extract_pdf(data, limits, quality=quality)
     if lower.endswith((".doc", ".docx", ".docm", ".xls", ".xlsx", ".xlsm", ".ppt", ".pptx", ".pptm")) or "officedocument" in ctype or "msword" in ctype:
         return extract_office(data, name, limits)
+    if data.startswith(b"PK\x03\x04"):
+        return extract_archive(data, limits, depth, quality)
     if lower.endswith((".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tif", ".tiff")) or ctype.startswith("image/"):
         return extract_image(data, limits, quality=quality)
     result = Extracted(kind="binary", sha256=sha256_bytes(data), size=len(data))
@@ -524,4 +510,35 @@ def extract_any(data: bytes, name: str, media_type: str | None, limits: Limits, 
     for url in extract_urls(decoded)[: limits.max_urls]:
         _append_url(result, url, "binary-strings")
     result.fingerprints["sha256"] = result.sha256
+    return result
+
+
+def extract_archive(data: bytes, limits: Limits, depth: int, quality: bool) -> Extracted:
+    result = Extracted(kind="archive", sha256=sha256_bytes(data), size=len(data))
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            infos = [i for i in archive.infolist() if not i.is_dir()]
+            total = sum(i.file_size for i in infos)
+            compressed = max(1, sum(i.compress_size for i in infos))
+            if len(infos) > limits.max_archive_members or total > limits.max_archive_uncompressed_bytes or total / compressed > limits.max_compression_ratio:
+                raise ValueError("Archive expansion limit reached")
+            for info in infos:
+                name = info.filename.replace("\\", "/")
+                if info.flag_bits & 1:
+                    result.warnings.append("Encrypted archive member cannot be inspected")
+                    continue
+                if info.file_size > limits.max_attachment_bytes:
+                    result.warnings.append("Archive member exceeds size limit")
+                    continue
+                payload = archive.read(info)
+                child = extract_any(payload, name, None, limits, depth + 1, quality=quality)
+                result.attachments.append(AttachmentFinding(bounded_text(name,240), child.kind, len(payload), child.sha256, "PARTIAL" if child.warnings else "ANALYZED", sorted({e.code for e in child.evidence})))
+                result.attachments.extend(child.attachments)
+                result.urls.extend(child.urls)
+                result.pages.extend(child.pages)
+                result.evidence.extend(child.evidence)
+                result.text = bounded_text(result.text + "\n" + child.text, limits.max_text_chars)
+                result.warnings.extend(child.warnings)
+    except (zipfile.BadZipFile, RuntimeError, ValueError, NotImplementedError) as exc:
+        result.warnings.append(f"Archive analysis incomplete: {type(exc).__name__}: {exc}")
     return result

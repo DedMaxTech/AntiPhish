@@ -13,4 +13,17 @@ htmlcov/
 *.tmp
 models/Qwen3.5-4B/
 models/siglip2-base-patch16-224/
+models/ocr/
 reports/external-*.json
+artifacts/*.reputation.sqlite
+artifacts/*-wal
+artifacts/*-shm
+.env
+reports/history.sqlite*
+artifacts/*.domains.sqlite*
+reports/revision-2026-10/
+data/private/
+models/logo-references/
+models/logo-index.npz
+models/logo-index.json
+models/phishing-scam-detector-base/

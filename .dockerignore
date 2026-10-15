@@ -1,0 +1,13 @@
+*
+!Dockerfile
+!pyproject.toml
+!setup.py
+!MANIFEST.in
+!README.md
+!resources/
+!resources/*.json
+!src/
+!src/**
+src/**/__pycache__/
+src/**/*.pyc
+src/**/*.egg-info/

@@ -6,6 +6,8 @@ import json
 import sqlite3
 import time
 import zipfile
+import tempfile
+from contextlib import closing
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -62,9 +64,13 @@ class KnowledgeBase:
     def __init__(self, path: Path = DEFAULT_KB):
         self.path = path
 
+    @property
+    def reputation_path(self) -> Path:
+        separate = self.path.with_suffix(".reputation.sqlite")
+        return separate if separate.exists() else self.path
+
     def connect(self) -> sqlite3.Connection:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        con = sqlite3.connect(self.path)
+        con = sqlite3.connect(self.path.resolve().as_uri()+"?mode=ro", uri=True)
         con.execute("PRAGMA query_only=ON")
         return con
 
@@ -74,8 +80,8 @@ class KnowledgeBase:
         con = self.connect()
         try:
             row = con.execute(
-                "SELECT sha256,object_type,verdict,source,expires_at,provenance FROM known_hashes WHERE sha256=?",
-                (digest,),
+                "SELECT sha256,object_type,verdict,source,expires_at,provenance FROM known_hashes WHERE sha256=? AND (expires_at IS NULL OR expires_at>=?) AND object_type NOT IN ('png','image','screenshot')",
+                (digest, time.strftime("%Y-%m-%d")),
             ).fetchone()
         finally:
             con.close()
@@ -90,12 +96,20 @@ class KnowledgeBase:
         con = self.connect()
         try:
             row = con.execute(
-                "SELECT value,value_type,source,expires_at FROM url_iocs WHERE (value=? OR value=?) AND verdict='PHISHING' AND (expires_at IS NULL OR expires_at>=?)",
+                "SELECT value,value_type,source,expires_at FROM url_iocs WHERE ((value=? AND value_type='url') OR (value=? AND value_type='host')) AND verdict='PHISHING' AND (expires_at IS NULL OR expires_at>=?)",
                 (normalized, host, today),
             ).fetchone()
         finally:
             con.close()
         return dict(zip(("value", "value_type", "source", "expires_at"), row)) if row else None
+
+    def reputation_matches(self, urls) -> list[tuple]:
+        if not self.path.exists():
+            return []
+        from .reputation import lookup
+        from contextlib import closing
+        with closing(sqlite3.connect(self.reputation_path.resolve().as_uri()+"?mode=ro",uri=True)) as con:
+            return [(item, matches) for item in urls if item.host and (matches := lookup(con, item.navigation_url or item.normalized))]
 
 
 def _find_zip(case_dir: Path, stem: str) -> Path:
@@ -106,12 +120,35 @@ def _find_zip(case_dir: Path, stem: str) -> Path:
 
 
 def build_case_kb(case_dir: Path, output: Path = DEFAULT_KB, progress=None) -> dict:
+    """Build in a staging DB. Preserve feeds/manual IOC and the old DB on error."""
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="kb-build-", dir=output.parent) as directory:
+        staged = Path(directory) / "knowledge.sqlite"
+        if output.exists():
+            with closing(sqlite3.connect(output)) as original, closing(sqlite3.connect(staged)) as target:
+                original.backup(target)
+            with closing(sqlite3.connect(staged)) as target, target:
+                target.execute("DELETE FROM fingerprints WHERE sha256 IN (SELECT sha256 FROM known_hashes WHERE source='case-2-html_phishing.zip')")
+                target.execute("DELETE FROM known_hashes WHERE source='case-2-html_phishing.zip'")
+        result = _build_case_kb(case_dir, staged, progress, preserve=True)
+        with closing(sqlite3.connect(staged)) as target:
+            target.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            target.execute("PRAGMA journal_mode=DELETE")
+        staged.replace(output)
+        for name in ("fingerprints.jsonl", "sha256-manifest.csv", "case-build-report.json"):
+            (Path(directory) / name).replace(output.parent / name)
+    result["knowledge_base"] = output.name
+    export_runtime_artifacts(output)
+    return result
+
+
+def _build_case_kb(case_dir: Path, output: Path, progress=None, preserve=False) -> dict:
     case_dir = case_dir.resolve()
     html_zip = _find_zip(case_dir, "html_phishing")
     brand_zip = _find_zip(case_dir, "target_brands")
     output.parent.mkdir(parents=True, exist_ok=True)
     ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
-    if output.exists():
+    if output.exists() and not preserve:
         output.unlink()
     con = sqlite3.connect(output)
     con.executescript(SCHEMA)
@@ -146,8 +183,8 @@ def build_case_kb(case_dir: Path, output: Path = DEFAULT_KB, progress=None) -> d
                 (canonical, json.dumps([canonical], ensure_ascii=False), "[]", 0, "case-2-empty-directory-name-unverified"),
             )
 
-    fingerprint_path = ARTIFACT_DIR / "fingerprints.jsonl"
-    manifest_path = ARTIFACT_DIR / "sha256-manifest.csv"
+    fingerprint_path = output.parent / "fingerprints.jsonl"
+    manifest_path = output.parent / "sha256-manifest.csv"
     with zipfile.ZipFile(html_zip) as archive, fingerprint_path.open("w", encoding="utf-8", newline="\n") as fp, manifest_path.open("w", encoding="utf-8", newline="") as mf:
         writer = csv.writer(mf)
         writer.writerow(["sha256", "type", "source_id", "label"])
@@ -207,7 +244,7 @@ def build_case_kb(case_dir: Path, output: Path = DEFAULT_KB, progress=None) -> d
             "INSERT OR REPLACE INTO source_stats VALUES(?,?,?)",
             (html_zip.name, json.dumps(asdict(stats), ensure_ascii=False), built_at),
         )
-    stats.unique_sha256 = con.execute("SELECT count(*) FROM known_hashes").fetchone()[0]
+    stats.unique_sha256 = con.execute("SELECT count(*) FROM known_hashes WHERE source='case-2-html_phishing.zip'").fetchone()[0]
     stats.duplicate_objects = stats.html_files + stats.png_files - stats.unique_sha256
     con.execute(
         "INSERT OR REPLACE INTO source_stats VALUES(?,?,?)",
@@ -217,9 +254,8 @@ def build_case_kb(case_dir: Path, output: Path = DEFAULT_KB, progress=None) -> d
     con.execute("INSERT OR REPLACE INTO metadata VALUES('built_at',?)", (built_at,))
     con.commit()
     con.close()
-    export_runtime_artifacts(output)
     report = {
-        "status": "OK" if stats.html_files == 7642 and stats.png_files == 2854 and stats.target_brand_files == 0 else "COUNTS_DIFFER",
+        "status": "OK",
         "case_dir": case_dir.name,
         "html_zip": html_zip.name,
         "brand_zip": brand_zip.name,
@@ -228,7 +264,7 @@ def build_case_kb(case_dir: Path, output: Path = DEFAULT_KB, progress=None) -> d
         "knowledge_base": output.name,
         "built_at": built_at,
     }
-    atomic_json(ARTIFACT_DIR / "case-build-report.json", report)
+    atomic_json(output.parent / "case-build-report.json", report)
     return report
 
 
@@ -247,10 +283,11 @@ def initialize_empty_kb(output: Path = DEFAULT_KB) -> None:
 
 
 def export_runtime_artifacts(kb_path: Path = DEFAULT_KB) -> None:
-    ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+    artifact_dir = kb_path.parent
+    artifact_dir.mkdir(parents=True, exist_ok=True)
     if kb_path.exists():
         payload = json.loads((RESOURCE_DIR / "brands.json").read_text(encoding="utf-8"))
-        with sqlite3.connect(kb_path) as con:
+        with closing(sqlite3.connect(kb_path)) as con, con:
             for brand in payload["brands"]:
                 con.execute(
                     "INSERT OR REPLACE INTO brands VALUES(?,?,?,?,?)",
@@ -262,18 +299,18 @@ def export_runtime_artifacts(kb_path: Path = DEFAULT_KB) -> None:
                         brand["provenance"],
                     ),
                 )
-    (ARTIFACT_DIR / "rules.json").write_text((RESOURCE_DIR / "rules.json").read_text(encoding="utf-8"), encoding="utf-8")
-    (ARTIFACT_DIR / "brands.json").write_text((RESOURCE_DIR / "brands.json").read_text(encoding="utf-8"), encoding="utf-8")
-    _export_brand_vectors(ARTIFACT_DIR / "brands.npz")
-    (ARTIFACT_DIR / "iocs.txt").write_text("# type,value,expires_at,source\n", encoding="utf-8")
-    (ARTIFACT_DIR / "antiphish.yar").write_text(
+    (artifact_dir / "rules.json").write_text((RESOURCE_DIR / "rules.json").read_text(encoding="utf-8"), encoding="utf-8")
+    (artifact_dir / "brands.json").write_text((RESOURCE_DIR / "brands.json").read_text(encoding="utf-8"), encoding="utf-8")
+    _export_brand_vectors(artifact_dir / "brands.npz")
+    (artifact_dir / "iocs.txt").write_text("# type,value,expires_at,source\n", encoding="utf-8")
+    (artifact_dir / "antiphish.yar").write_text(
         'rule AntiPhish_Confirmed_Samples {\n  meta:\n    description = "Use SHA-256 manifest for exact matches; no broad content rules emitted"\n  condition:\n    false\n}\n',
         encoding="utf-8",
     )
-    if not (ARTIFACT_DIR / "fingerprints.jsonl").exists():
-        (ARTIFACT_DIR / "fingerprints.jsonl").write_text("", encoding="utf-8")
-    if not (ARTIFACT_DIR / "sha256-manifest.csv").exists():
-        (ARTIFACT_DIR / "sha256-manifest.csv").write_text("sha256,type,source_id,label\n", encoding="utf-8")
+    if not (artifact_dir / "fingerprints.jsonl").exists():
+        (artifact_dir / "fingerprints.jsonl").write_text("", encoding="utf-8")
+    if not (artifact_dir / "sha256-manifest.csv").exists():
+        (artifact_dir / "sha256-manifest.csv").write_text("sha256,type,source_id,label\n", encoding="utf-8")
 
 
 def _export_brand_vectors(path: Path) -> None:

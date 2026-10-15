@@ -10,7 +10,7 @@ from urllib.parse import urlsplit
 from .brands import detect_brands
 from .config import DEFAULT_KB, DEFAULT_LIMITS, Limits, RESOURCE_DIR
 from .deep import optional_deep_analysis
-from .extractors import Extracted, extract_any, extract_html
+from .extractors import Extracted, _append_url, extract_any, extract_html
 from .kb import KnowledgeBase
 from .models import AnalysisReport, AnalysisStatus, Evidence, Severity, UrlFinding, Verdict
 from .network import safe_browser_get, safe_http_get
@@ -31,9 +31,28 @@ class Analyzer:
     def __init__(self, kb_path: Path = DEFAULT_KB, limits: Limits = DEFAULT_LIMITS):
         self.kb = KnowledgeBase(kb_path)
         self.limits = limits
-        self.rules = json.loads((RESOURCE_DIR / "rules.json").read_text(encoding="utf-8"))
 
-    def analyze(self, source: str | Path | bytes, *, name: str | None = None, profile: str = "quality", network: str = "offline", browser_confirmation: str | None = None) -> AnalysisReport:
+    def analyze(self, source: str | Path | bytes, *, name: str | None = None, profile: str = "quality", network: str = "offline", browser_confirmation: str | None = None, base_url: str | None = None, fetcher=None) -> AnalysisReport:
+        started = time.perf_counter()
+        from .ocr import reset_budget
+        reset_budget()
+        from .active import reset_budget as reset_active_budget
+        reset_active_budget()
+        try:
+            report = self._analyze(source,name=name,profile=profile,network=network,browser_confirmation=browser_confirmation,base_url=base_url,fetcher=fetcher)
+            from .logging import completed
+            completed(report)
+            return report
+        except Exception as exc:
+            # A broken DB/model/parser must produce an explicit failure report
+            # rather than leaving the GUI worker stuck or presenting success.
+            report = AnalysisReport(analysis_status=AnalysisStatus.FAILED)
+            report.configuration.update(profile=profile,network_mode=network,network_analysis_status="FAILED")
+            report.warnings.append("Analysis failed: " + type(exc).__name__)
+            report.timings_ms["total"] = round((time.perf_counter()-started)*1000,2)
+            return report
+
+    def _analyze(self, source: str | Path | bytes, *, name: str | None = None, profile: str = "quality", network: str = "offline", browser_confirmation: str | None = None, base_url: str | None = None, fetcher=None) -> AnalysisReport:
         started = time.perf_counter()
         report = AnalysisReport()
         selected_profile = profile if profile in {"fast", "quality", "deep"} else "quality"
@@ -69,8 +88,10 @@ class Analyzer:
             "network_scope": "disabled" if network == "offline" else "pending",
             "network_analysis_status": "NOT_REQUESTED" if network == "offline" else "PENDING",
         }
+        from .runtime import manifest
+        report.configuration['runtime'] = manifest(self.kb.path)
+        stage_started = time.perf_counter()
         extracted: Extracted
-        base_url: str | None = None
         source_is_url = False
         try:
             if network not in {"offline", "http", "browser"}:
@@ -82,7 +103,7 @@ class Analyzer:
                 input_name = name or "stdin.eml"
                 media_type = mimetypes.guess_type(input_name)[0]
                 report.input = {"kind": "bytes", "name": input_name, "size": len(data)}
-                extracted = extract_any(data, input_name, media_type, analysis_limits, quality=quality_static)
+                extracted = extract_html(data, analysis_limits, base_url) if base_url else extract_any(data, input_name, media_type, analysis_limits, quality=quality_static)
             else:
                 value = str(source)
                 if value.lower().startswith(("http://", "https://")):
@@ -90,28 +111,8 @@ class Analyzer:
                     normalized = normalize_url(value)
                     base_url = normalized.normalized
                     report.input = {"kind": "url", "value": normalized.redacted, "network": network}
-                    if network == "offline":
-                        extracted = Extracted(kind="url", sha256="", size=0)
-                        extracted.urls.append(UrlFinding(original=normalized.redacted, normalized=normalized.redacted, host=normalized.host, registered_domain=normalized.registered_domain, source="input", flags=list(normalized.flags)))
-                    elif network == "http":
-                        fetched = safe_http_get(value, analysis_limits)
-                        base_url = fetched.final_url
-                        extracted = extract_html(fetched.body, analysis_limits, base_url=base_url) if "html" in fetched.content_type else extract_any(fetched.body, urlsplit(fetched.final_url).path or "download", fetched.content_type, analysis_limits, quality=quality_static)
-                        extracted.metadata["redirect_chain"] = fetched.chain
-                        for url_item in extracted.urls:
-                            if url_item.normalized == normalize_url(fetched.final_url).normalized:
-                                url_item.redirect_chain = fetched.chain
-                        report.input.update(final_url=normalize_url(fetched.final_url).redacted, http_status=fetched.status)
-                        report.network_activity.append({"url": normalized.redacted, "status": "FETCHED", "http_status": fetched.status, "final_url": normalize_url(fetched.final_url).redacted})
-                        report.configuration["network_analysis_status"] = "COMPLETE"
-                    elif network == "browser":
-                        fetched = safe_browser_get(value, analysis_limits, browser_confirmation)
-                        base_url = fetched.final_url
-                        extracted = extract_html(fetched.body, analysis_limits, base_url=base_url)
-                        extracted.metadata["redirect_chain"] = fetched.chain
-                        report.input.update(final_url=normalize_url(fetched.final_url).redacted, http_status=fetched.status)
-                        report.network_activity.append({"url": normalized.redacted, "status": "BROWSER_RENDERED", "http_status": fetched.status, "final_url": normalize_url(fetched.final_url).redacted})
-                        report.configuration["network_analysis_status"] = "COMPLETE"
+                    extracted = Extracted(kind="url", sha256="", size=0)
+                    _append_url(extracted, normalized.normalized, "input")
                 else:
                     path = Path(value).resolve()
                     if not path.is_file():
@@ -123,11 +124,16 @@ class Analyzer:
                     report.input = {"kind": "file", "name": path.name, "size": size}
                     extracted = extract_any(data, path.name, mimetypes.guess_type(path.name)[0], analysis_limits, quality=quality_static)
 
-            if source_is_url:
-                report.configuration["network_scope"] = "primary-url" if network != "offline" else "disabled"
-            elif network != "offline":
-                report.configuration["network_scope"] = "links-extracted-from-input"
-                self._enrich_extracted_links(extracted, report, network, browser_confirmation, analysis_limits, quality_static)
+            if extracted.kind == "eml":
+                extracted.metadata["message_text"] = extracted.text
+                extracted.metadata["message_scopes"] = {p.id for p in extracted.pages}
+            report.timings_ms['extraction'] = round((time.perf_counter() - stage_started) * 1000, 2)
+            stage_started = time.perf_counter()
+            if network != "offline":
+                from .traversal import enrich
+                fetch = fetcher or (safe_http_get if network == "http" else lambda u, l: safe_browser_get(u, l, browser_confirmation))
+                enrich(extracted, report, fetch, analysis_limits, quality_static, _network_candidate_priority)
+            report.timings_ms['network'] = round((time.perf_counter() - stage_started) * 1000, 2)
         except Exception as exc:
             if network != "offline":
                 report.configuration["network_analysis_status"] = "FAILED"
@@ -137,7 +143,9 @@ class Analyzer:
             return report
 
         report.input.update({"detected_type": extracted.kind, "sha256": extracted.sha256 or None})
+        stage_started = time.perf_counter()
         report.urls = _deduplicate_urls(extracted.urls)
+        report.pages = extracted.pages
         report.attachments = extracted.attachments
         report.fingerprints = extracted.fingerprints
         report.reason_codes = _deduplicate_evidence(extracted.evidence)
@@ -150,27 +158,30 @@ class Analyzer:
             "LOGIN_IFRAME", "FINANCIAL_LOGIN_LURE", "FAKE_DOCUMENT_VIEWER",
         }))
         report.brands, brand_evidence = detect_brands(brand_text, report.urls, sender_domain, high_risk_brand_context)
-        report.reason_codes.extend(brand_evidence)
+        # Cross-page brand findings are descriptive. Decisions are evaluated
+        # below within each page/form, not from this global host collection.
 
         if extracted.sha256:
             ioc = self.kb.lookup_hash(extracted.sha256)
             if ioc and ioc.get("verdict") == "PHISHING":
+                confirmed = ioc.get("provenance") != "provider-labelled-phishing-sample"
                 report.reason_codes.append(Evidence(
-                    code="IOC_SHA256_MATCH", severity=Severity.CRITICAL,
-                    summary="SHA-256 полностью совпал с подтверждённым вредоносным объектом",
+                    code="IOC_SHA256_MATCH" if confirmed else "KNOWN_SAMPLE_MATCH", severity=Severity.CRITICAL if confirmed else Severity.INFO,
+                    summary="Совпадение с подтверждённым IOC" if confirmed else "Совпадение с неразмеченным объектом архивного корпуса; блокировка по хешу отключена",
                     details={"sha256": extracted.sha256, "source": ioc["source"], "provenance": ioc["provenance"]}, independent_group="exact-ioc",
                 ))
         for attachment in report.attachments:
             ioc = self.kb.lookup_hash(attachment.sha256)
             if ioc and ioc.get("verdict") == "PHISHING":
+                confirmed = ioc.get("provenance") != "provider-labelled-phishing-sample"
                 report.reason_codes.append(Evidence(
-                    code="IOC_SHA256_MATCH", severity=Severity.CRITICAL,
-                    summary="Вложение полностью совпало с подтверждённым вредоносным объектом",
+                    code="IOC_SHA256_MATCH" if confirmed else "KNOWN_SAMPLE_MATCH", severity=Severity.CRITICAL if confirmed else Severity.INFO,
+                    summary="Вложение совпало с подтверждённым IOC" if confirmed else "Вложение совпало с образцом корпуса; требуется анализ поведения",
                     details={"attachment": attachment.name, "sha256": attachment.sha256, "source": ioc["source"], "provenance": ioc["provenance"]}, independent_group="exact-ioc",
                 ))
         for url in report.urls:
             if url.host and url.normalized:
-                ioc = self.kb.lookup_url(url.host, url.normalized)
+                ioc = self.kb.lookup_url(url.host, url.navigation_url or url.normalized)
                 if ioc:
                     report.reason_codes.append(Evidence(
                         code="KNOWN_BAD_URL", severity=Severity.CRITICAL,
@@ -178,14 +189,38 @@ class Analyzer:
                         details={"url": url.original, "source": ioc["source"], "expires_at": ioc["expires_at"]}, independent_group="exact-ioc",
                     ))
 
+        from .reputation import status as reputation_status
+        report.reputation = reputation_status(self.kb.reputation_path)
+        for url, matches in self.kb.reputation_matches(report.urls):
+            verified = any(m["confidence"] == "verified" for m in matches)
+            report.reason_codes.append(Evidence(
+                "KNOWN_BAD_URL" if verified else "REPUTATION_URL_MATCH", Severity.CRITICAL if verified else Severity.HIGH,
+                "Полный URL найден в локальном снимке фишинговой базы",
+                {"url": url.original, "sources": matches, "match_type": "exact-full-url"}, independent_group="reputation", scope_id=url.scope_id))
+
+        from .domains import annotate
+        try:
+            annotate(report, self.kb.path.with_suffix('.domains.sqlite'))
+        except Exception as exc:
+            # An advisory CSV must never disable the actual detector.
+            report.configuration['domain_context'] = {'status':'UNAVAILABLE', 'error':type(exc).__name__, 'verified':False, 'affects_verdict':False}
+        report.timings_ms['knowledge_and_brands'] = round((time.perf_counter() - stage_started) * 1000, 2)
+        stage_started = time.perf_counter()
+        if extracted.kind == 'eml':
+            from .textmodel import configured_score
+            scores, warnings = configured_score(extracted.metadata.get('subject', '') + '\n' + extracted.metadata.get('message_text', extracted.text))
+            report.model_evidence.extend(scores)
+            report.model_warnings.extend(warnings)
+
         if selected_profile == "deep":
-            static_context = ", ".join(sorted({e.code for e in report.reason_codes}))
-            deep_text = brand_text
-            if extracted.html_text:
-                deep_text += "\nSTATIC HTML (untrusted, do not execute):\n" + extracted.html_text[:12000]
-            if static_context:
-                deep_text += "\nSTATIC EXTRACTOR FACTS:\n" + static_context
-            model_evidence, warnings = optional_deep_analysis(deep_text, image_bytes=data if extracted.kind == "image" and "data" in locals() else None)
+            from .policy import evaluate_pages
+            evaluate_pages(report)
+            facts = [{"scope":p.id,"origin":p.url,"identity":p.claimed_brands,"forms":[{"types":f.sensitive_types,"destination":f.destination,"collector_observed":f.collector_observed} for f in p.forms]} for p in report.pages if p.forms]
+            deep_text = "EXTRACTED PAGE FACTS:\n" + json.dumps(facts[:8],ensure_ascii=False)[:4000]
+            deep_text += "\nMESSAGE:\n" + extracted.metadata.get("message_text",brand_text)[:4500]
+            deep_text += "\nPAGE TEXT:\n" + "\n".join(p.text[:700] for p in report.pages[-4:])
+            deep_text += "\nHTML EXCERPT:\n" + extracted.html_text[:1500]
+            model_evidence, warnings = optional_deep_analysis(deep_text, image_bytes=data if extracted.kind == "image" and "data" in locals() else extracted.metadata.get("visual_image"))
             report.model_evidence.extend(model_evidence)
             report.model_warnings.extend(warnings)
             if any(item.get("suspicious") is True for item in model_evidence):
@@ -193,131 +228,40 @@ class Analyzer:
         elif profile not in {"fast", "quality", "deep"}:
             report.warnings.append(f"Unknown profile {profile}; quality policy used")
 
-        if report.warnings:
+        report.timings_ms['models'] = round((time.perf_counter() - stage_started) * 1000, 2)
+        stage_started = time.perf_counter()
+        report.configuration['static_analysis_status'] = 'PARTIAL' if report.warnings else 'COMPLETE'
+        report.configuration['model_analysis_status'] = 'PARTIAL' if report.model_warnings or any(e.get('parse_status') == 'INVALID_JSON' for e in report.model_evidence) else 'COMPLETE' if selected_profile == 'deep' else 'NOT_REQUESTED'
+        if report.model_evidence and report.configuration['model_analysis_status'] == 'NOT_REQUESTED':
+            report.configuration['model_analysis_status'] = 'COMPLETE'
+
+        if report.warnings or report.configuration['network_analysis_status'] in {'FAILED', 'PARTIAL', 'LIMITED', 'RESTRICTED'} or report.configuration['model_analysis_status'] == 'PARTIAL':
             report.analysis_status = AnalysisStatus.PARTIAL
-            report.reason_codes.append(Evidence(code="ANALYSIS_INCOMPLETE", severity=Severity.INFO, summary="Часть анализа не выполнена полностью", details={"warnings": report.warnings[:20]}, independent_group="status"))
+            report.reason_codes.append(Evidence(code="ANALYSIS_INCOMPLETE", severity=Severity.INFO, summary="Часть запрошенного анализа не выполнена полностью", details={"warnings": report.warnings[:20], 'network_status': report.configuration['network_analysis_status'], 'model_warnings': report.model_warnings}, independent_group="status"))
 
         report.reason_codes = _deduplicate_evidence(report.reason_codes)
+        from .policy import evaluate_pages
+        evaluate_pages(report)
+        from .content import evaluate_message, evaluate_page_scenarios
+        evaluate_message(extracted, report)
+        evaluate_page_scenarios(report)
+        from .templates import match_pages
+        match_pages(report, self.kb.path)
         report.verdict = self._arbitrate(report)
+        report.timings_ms['decision'] = round((time.perf_counter() - stage_started) * 1000, 2)
         report.timings_ms["total"] = round((time.perf_counter() - started) * 1000, 2)
         return report
 
-    def _enrich_extracted_links(self, extracted: Extracted, report: AnalysisReport, network: str, browser_confirmation: str | None, limits: Limits, quality_static: bool) -> None:
-        all_urls: list[UrlFinding] = []
-        seen: set[str] = set()
-        for item in extracted.urls:
-            if not item.normalized or item.normalized in seen:
-                continue
-            seen.add(item.normalized)
-            all_urls.append(item)
-        hidden_redirect = any(item.code == "HIDDEN_REDIRECT" for item in extracted.evidence)
-        ranked: list[tuple[int, int, UrlFinding]] = []
-        for index, item in enumerate(all_urls):
-            priority = _network_candidate_priority(item, hidden_redirect)
-            if priority is not None:
-                ranked.append((priority, -index, item))
-        ranked.sort(reverse=True, key=lambda row: (row[0], row[1]))
-        # Fetching ten personalised links through the same redirector adds risk
-        # but almost no information. One candidate per registered domain is enough.
-        candidates: list[UrlFinding] = []
-        sites: set[str] = set()
-        for _priority, _index, item in ranked:
-            site = item.registered_domain or item.host or item.normalized
-            if site in sites:
-                continue
-            sites.add(site)
-            candidates.append(item)
-        fetch_limit = 5 if network == "http" else 2
-        report.configuration["network_urls_total"] = len(all_urls)
-        report.configuration["network_candidates"] = len(candidates)
-        report.configuration["network_ignored_resources"] = len(all_urls) - len(ranked)
-        report.configuration["network_fetch_limit"] = fetch_limit
-        if not candidates:
-            report.configuration["network_analysis_status"] = "NOT_APPLICABLE"
-            return
-        had_failure = False
-        had_success = False
-        had_restricted = False
-        for item in candidates[:fetch_limit]:
-            if "TOKENIZED_URL" in item.flags:
-                report.network_activity.append({"url": item.original, "status": "SKIPPED_SENSITIVE_QUERY"})
-                had_restricted = True
-                continue
-            try:
-                fetched = safe_http_get(item.normalized, limits) if network == "http" else safe_browser_get(item.normalized, limits, browser_confirmation)
-                if "html" in fetched.content_type:
-                    remote = extract_html(fetched.body, limits, base_url=fetched.final_url)
-                else:
-                    remote = extract_any(
-                        fetched.body,
-                        urlsplit(fetched.final_url).path or "download",
-                        fetched.content_type,
-                        limits,
-                        quality=quality_static,
-                    )
-                extracted.urls.extend(remote.urls)
-                extracted.fingerprints.setdefault("network_pages", []).append({
-                    "url": normalize_url(fetched.final_url).redacted,
-                    "fingerprints": remote.fingerprints,
-                })
-                if remote.warnings:
-                    had_failure = True
-                    report.network_warnings.extend(f"Network page {item.host}: {warning}" for warning in remote.warnings)
-                else:
-                    had_success = True
-                    extracted.attachments.extend(remote.attachments)
-                    extracted.evidence.extend(remote.evidence)
-                    extracted.text = bounded_text(extracted.text + "\n" + remote.text, limits.max_text_chars)
-                    extracted.html_text = bounded_text(extracted.html_text + "\n" + remote.html_text, limits.max_html_chars)
-                report.network_activity.append({
-                    "url": item.original,
-                    "status": ("PARTIAL" if remote.warnings else ("FETCHED" if network == "http" else "BROWSER_RENDERED")),
-                    "http_status": fetched.status,
-                    "final_url": normalize_url(fetched.final_url).redacted,
-                    "redirect_chain": fetched.chain,
-                })
-            except Exception as exc:
-                had_failure = True
-                report.network_activity.append({"url": item.original, "status": "FAILED", "error": type(exc).__name__})
-                report.network_warnings.append(f"Network analysis failed for {item.host or 'URL'}: {type(exc).__name__}")
-        if had_failure:
-            network_status = "PARTIAL"
-        elif len(candidates) > fetch_limit:
-            network_status = "LIMITED"
-        elif had_restricted and not had_success:
-            network_status = "RESTRICTED"
-        else:
-            network_status = "COMPLETE"
-        report.configuration["network_analysis_status"] = network_status
-
     def _arbitrate(self, report: AnalysisReport) -> Verdict:
-        codes = {e.code for e in report.reason_codes}
-        blocking = self.rules["blocking"]
-        exact = bool(codes.intersection(blocking["exact_ioc_codes"]))
-        if exact:
-            return Verdict.PHISHING
-        composite = (
-            bool(codes.intersection(blocking["intent_codes"]))
-            and bool(codes.intersection(blocking["recipient_codes"]))
-            and bool(codes.intersection(blocking["mismatch_codes"]))
-        )
-        if composite and report.analysis_status == AnalysisStatus.COMPLETE:
-            return Verdict.PHISHING
-        single_high = codes.intersection(self.rules["suspicious"]["single_high_codes"])
-        medium_groups = {
-            e.independent_group for e in report.reason_codes
-            if e.severity in {Severity.MEDIUM, Severity.HIGH, Severity.CRITICAL} and e.independent_group not in {"model", "status"}
-        }
-        if single_high or len(medium_groups) >= self.rules["suspicious"]["minimum_medium_independent_groups"] or composite:
-            return Verdict.SUSPICIOUS
-        return Verdict.NOT_DETECTED
+        from .policy import arbitrate
+        return arbitrate(report)
 
 
 def _deduplicate_urls(urls: list[UrlFinding]) -> list[UrlFinding]:
     result: list[UrlFinding] = []
     seen: set[tuple] = set()
     for item in urls:
-        key = (item.normalized, item.source, item.displayed_text)
+        key = (item.navigation_url or item.normalized, item.scope_id, item.source, item.displayed_text)
         if key not in seen:
             result.append(item)
             seen.add(key)
@@ -333,7 +277,13 @@ def _network_candidate_priority(item: UrlFinding, hidden_redirect: bool) -> int 
         return None
     if any(path.endswith(suffix) for suffix in _STATIC_RESOURCE_SUFFIXES):
         return None
-    if source.startswith("qr:"):
+    if source == "hosted-document":
+        priority = 160
+    elif source in {"input", "link-wrapper"}:
+        priority = 125
+    elif source == "javascript-navigation":
+        priority = 90
+    elif source.startswith("qr:"):
         priority = 120
     elif source == "meta-refresh":
         priority = 115
@@ -341,8 +291,6 @@ def _network_candidate_priority(item: UrlFinding, hidden_redirect: bool) -> int 
         priority = 100
     elif source in {"html:iframe:src", "html:frame:src"}:
         priority = 95
-    elif source == "javascript" and hidden_redirect:
-        priority = 90
     elif source == "text" or source.startswith(("pdf:", "office:")):
         priority = 80
     else:
@@ -358,7 +306,7 @@ def _deduplicate_evidence(evidence: list[Evidence]) -> list[Evidence]:
     result: list[Evidence] = []
     seen: set[tuple] = set()
     for item in evidence:
-        key = (item.code, json.dumps(item.details, ensure_ascii=False, sort_keys=True, default=str))
+        key = (item.code, item.scope_id, json.dumps(item.details, ensure_ascii=False, sort_keys=True, default=str))
         if key not in seen:
             result.append(item)
             seen.add(key)

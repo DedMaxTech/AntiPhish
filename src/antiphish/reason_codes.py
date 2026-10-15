@@ -7,7 +7,7 @@ REASON_DESCRIPTIONS = {
     "SCRIPT_EXFILTRATION": "Script collects fields and sends them over the network",
     "BRAND_DOMAIN_MISMATCH": "A verified brand is used on a non-official domain",
     "DISPLAY_HREF_MISMATCH": "Displayed link domain differs from its destination",
-    "QR_EXTERNAL_DESTINATION": "QR code leads to an unrelated destination",
+    "QR_EXTERNAL_DESTINATION": "QR code contains a web address; not standalone proof of phishing",
     "FAKE_DOCUMENT_VIEWER": "Page imitates a document viewer and asks for secrets",
     "HIDDEN_REDIRECT": "Page contains an automatic redirect",
     "FROM_REPLYTO_MISMATCH": "From and Reply-To use unrelated domains",
@@ -32,4 +32,30 @@ REASON_DESCRIPTIONS = {
     "KNOWN_BAD_URL": "Destination matches a confirmed, non-expired IOC",
     "MODEL_SUSPICION": "Local auxiliary model found suspicious intent",
     "ANALYSIS_INCOMPLETE": "One or more objects could not be analyzed completely",
+    'KNOWN_SAMPLE_MATCH': 'Unreviewed corpus object match; does not block by hash',
+    'REPUTATION_URL_MATCH': 'Exact URL found in a local community feed; review evidence',
+    'PHISHING_FORM_ROUTE': 'Scoped identity deception is tied to an observed secret collector',
+    'BRAND_FORM_IMPERSONATION': 'Brand secret/personal-data request outside documented domains',
+    'UNVERIFIED_AUTH_COLLECTOR': 'Official page sends a secret to an unverified recipient',
+    'DYNAMIC_SECRET_COLLECTOR': 'A synthetic secret recipient was observed; request was blocked',
+    'CAMPAIGN_TEMPLATE_MATCH': 'Scoped form/text similarity to an eligible local example',
+    'OCR_TEXT_EXTRACTED': 'Local OCR recovered image text; never automatic blocking identity',
+    'UNVERIFIED_REWARD_LURE': 'Brand reward CTA leads to an unverified external destination',
+    'UNVERIFIED_INVESTMENT_LURE': 'Claimed investment provider and destination do not agree',
+    'UNVERIFIED_ACCOUNT_LURE': 'Account/payment update CTA leads outside documented brand domains',
+    'SECURITY_THREAT_TO_MESSENGER': 'Financial security warning moves the conversation to a messenger',
+    'REPLY_FOR_REWARD': 'Promise to double a balance requires an email reply',
+    'VISUAL_REWARD_LURE': 'Image promises a brand reward via an external destination',
+    'MAILBOX_LOGIN_IN_CMS_ASSET': 'Observed mailbox collector is hosted in a CMS resource path',
+    'ACTIVE_PAYLOAD_BEHAVIOR': 'PDF launch/import/submit action or field read and submission',
+    'DOCUMENT_IDENTITY_HOSTING_MISMATCH': 'Claimed signing/document service redirects to user-controlled hosting',
+    'ACCOUNT_RECOVERY_ON_USER_HOSTING': 'Mailbox recovery CTA redirects to user-controlled hosting',
+    'HTML_SMUGGLING_RECOVERED': 'Literal encoded HTML recovered statically; execution not inferred',
+    'UNVERIFIED_TRANSFER_LURE': 'Claimed bank asks to complete a transfer using details on an unrelated site',
 }
+
+
+def catalog() -> list[dict]:
+    blocking = {'IOC_SHA256_MATCH', 'KNOWN_BAD_URL', 'PHISHING_FORM_ROUTE'}
+    informational = {'ANALYSIS_INCOMPLETE', 'KNOWN_SAMPLE_MATCH', 'OCR_TEXT_EXTRACTED', 'QR_EXTERNAL_DESTINATION'}
+    return [{'code': code, 'description': description, 'policy_role': 'blocking-proof' if code in blocking else 'observation' if code in informational else 'context-or-review; inspect scoped policy'} for code, description in sorted(REASON_DESCRIPTIONS.items())]

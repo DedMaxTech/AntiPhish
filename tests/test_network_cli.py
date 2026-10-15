@@ -20,6 +20,7 @@ def test_offline_url_never_calls_network(empty_kb, monkeypatch):
     monkeypatch.setattr("antiphish.analyzer.safe_browser_get", lambda *a, **k: (_ for _ in ()).throw(AssertionError("network called")))
     report = Analyzer(empty_kb).analyze("https://example.org/login", network="offline")
     assert report.analysis_status.value == "COMPLETE"
+    assert report.configuration['static_analysis_status'] == 'COMPLETE'
     assert report.input["network"] == "offline"
 
 
@@ -42,12 +43,12 @@ def test_http_mode_follows_links_extracted_from_file(empty_kb, monkeypatch):
     monkeypatch.setattr("antiphish.analyzer.safe_http_get", fake_get)
     report = Analyzer(empty_kb).analyze(b"<a href='https://public.example/page'>Open</a>", name="mail.html", network="http")
     assert calls == ["https://public.example/page"]
-    assert report.configuration["network_scope"] == "links-extracted-from-input"
+    assert report.configuration["network_scope"] == "navigation-graph"
     assert report.network_activity[0]["status"] == "FETCHED"
     assert "SENSITIVE_FORM" in {item.code for item in report.reason_codes}
 
 
-def test_network_candidate_selection_ignores_page_assets_and_deduplicates_sites(empty_kb, monkeypatch):
+def test_network_candidate_selection_ignores_assets_but_keeps_distinct_paths(empty_kb, monkeypatch):
     calls = []
 
     def fake_get(url, limits):
@@ -66,9 +67,9 @@ def test_network_candidate_selection_ignores_page_assets_and_deduplicates_sites(
       <a href='https://account.example.org/check'>Open account</a>
       </body></html>"""
     report = Analyzer(empty_kb).analyze(body, name="newsletter.html", network="http")
-    assert calls == ["https://www.twitch.tv/r/e/campaign-one", "https://account.example.org/check"]
+    assert calls == ["https://www.twitch.tv/r/e/campaign-one", "https://www.twitch.tv/r/e/campaign-two", "https://account.example.org/check"]
     assert report.configuration["network_urls_total"] == 7
-    assert report.configuration["network_candidates"] == 2
+    assert report.configuration["network_candidates"] == 3
     assert report.configuration["network_ignored_resources"] == 4
 
 
@@ -82,10 +83,11 @@ def test_failed_optional_network_enrichment_does_not_downgrade_static_phishing(e
     <a href='https://collector.bad.example'>https://portal.example/login</a>"""
     report = Analyzer(empty_kb).analyze(body, name="phish.html", network="http")
     assert report.verdict == Verdict.PHISHING
-    assert report.analysis_status.value == "COMPLETE"
+    assert report.analysis_status.value == "PARTIAL"
+    assert report.configuration['static_analysis_status'] == 'COMPLETE'
     assert report.configuration["network_analysis_status"] == "PARTIAL"
     assert report.network_warnings
-    assert "ANALYSIS_INCOMPLETE" not in {item.code for item in report.reason_codes}
+    assert "ANALYSIS_INCOMPLETE" in {item.code for item in report.reason_codes}
 
 
 def test_fast_profile_skips_qr_while_quality_decodes_it(empty_kb):
@@ -132,7 +134,7 @@ def test_cli_exit_codes_and_schema(tmp_path, empty_kb, capsys):
     benign.write_bytes(b"From: a@corp.ru\nTo: b@corp.ru\nSubject: Meeting\n\nHello")
     assert main(["analyze", str(benign), "--kb", str(empty_kb), "--json"]) == 0
     output = capsys.readouterr().out
-    assert '"schema_version": "1.0"' in output
+    assert '"schema_version": "2.0"' in output
     assert main(["analyze", str(tmp_path / "missing.eml"), "--kb", str(empty_kb)]) == 30
 
 

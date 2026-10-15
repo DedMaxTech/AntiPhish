@@ -56,3 +56,8 @@ def simhash64(tokens: Iterable[str]) -> str:
         return "0" * 16
     result = sum(1 << bit for bit, score in enumerate(vector) if score >= 0)
     return f"{result:016x}"
+
+
+def pasted_name(data: bytes, prefix="pasted") -> str:
+    is_html = re.search(rb"(?is)^\s*(?:<!doctype\s+html|<html|<head|<body|<form|<h[1-6]|<div|<script|<a\s)",data[:4096])
+    return prefix + (".html" if is_html else ".eml")

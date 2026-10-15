@@ -47,12 +47,13 @@ def run_case_behavior_benchmark(case_dir: Path, max_items: int | None = None, pr
         detected = verdicts["PHISHING"] + verdicts["SUSPICIOUS"]
         report = {
             "benchmark": "case-2-behavioral-no-kb",
-            "evidence_scope": "all selected provider-labelled phishing HTML; exact hashes and case fingerprints disabled",
+            "evidence_scope": "all selected provider-labelled HTML; exact hashes and case fingerprints disabled; captured error/legitimate pages may be present",
             "split_policy": "No fitting is performed. Every SHA-256 and DOM fingerprint is unseen by the empty evaluation KB; DOM families are reported for audit.",
             "source": archive_path.name,
             "samples": total,
             "verdicts": dict(verdicts),
-            "metrics": {"phishing_plus_suspicious_recall": detected / total if total else None, "phishing_block_recall": verdicts["PHISHING"] / total if total else None},
+            "metrics": {"provider_label_alert_rate": detected / total if total else None, "provider_label_block_rate": verdicts["PHISHING"] / total if total else None},
+            "metric_note": "These are alert proportions over unreviewed provider labels, not verified recall or held-out effectiveness.",
             "families": {"unique_dom_simhash64": len(families), "largest_family": max(families.values(), default=0)},
             "reason_counts": dict(reasons.most_common()),
             "misses": misses,

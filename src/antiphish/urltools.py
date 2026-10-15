@@ -14,7 +14,7 @@ try:
 except ImportError:  # pragma: no cover
     tldextract = None
 
-_TLD_EXTRACTOR = tldextract.TLDExtract(suffix_list_urls=()) if tldextract else None
+_TLD_EXTRACTOR = tldextract.TLDExtract(suffix_list_urls=(), include_psl_private_domains=True) if tldextract else None
 
 from .utils import TOKEN_KEYS, redact_value
 
@@ -22,7 +22,7 @@ from .utils import TOKEN_KEYS, redact_value
 URL_RE = re.compile(r"(?i)\bhttps?://[^\s<>\"']+")
 ACTION_PATH_RE = re.compile(r"(?i)/(?:unsubscribe|confirm|verify|activate|reset|magic|invite|login)(?:/|$)")
 SHORTENERS = {
-    "bit.ly", "t.co", "tinyurl.com", "goo.gl", "clck.ru", "vk.cc", "is.gd", "cutt.ly", "shorturl.at"
+    "bit.ly", "t.co", "tinyurl.com", "goo.gl", "clck.ru", "vk.cc", "is.gd", "cutt.ly", "shorturl.at", "page.link"
 }
 
 
@@ -59,7 +59,12 @@ def _extract_registered_domain(host: str) -> str:
 
 
 def normalize_url(raw: str) -> NormalizedUrl:
-    value = raw.strip().strip("<>[](){}.,;\"'")
+    value = raw.strip()
+    for left,right in (("<",">"),("\"","\""),("'","'")):
+        if value.startswith(left) and value.endswith(right):
+            value=value[1:-1]
+    if any(ord(c) < 32 for c in value):
+        raise ValueError("control characters in URL")
     split = urlsplit(value)
     if split.scheme.lower() not in {"http", "https"}:
         raise ValueError("only http/https URLs are supported")
@@ -98,15 +103,19 @@ def normalize_url(raw: str) -> NormalizedUrl:
     if ACTION_PATH_RE.search(split.path):
         flags.append("ACTION_URL")
     query = parse_qsl(split.query, keep_blank_values=True)
-    if any(TOKEN_KEYS.search(k) or (len(v) >= 24 and re.search(r"[A-Za-z].*\d|\d.*[A-Za-z]", v)) for k, v in query):
+    def sensitive_query(k,v):
+        return TOKEN_KEYS.search(k) or (len(v) >= 24 and re.search(r"[A-Za-z].*\d|\d.*[A-Za-z]", v))
+    if any(sensitive_query(k,v) for k,v in query):
         flags.append("TOKENIZED_URL")
     default_port = (split.scheme.lower() == "https" and port in {None, 443}) or (split.scheme.lower() == "http" and port in {None, 80})
     display_host = f"[{ascii_host}]" if ":" in ascii_host else ascii_host
     netloc = display_host if default_port else f"{display_host}:{port}"
     path = quote(split.path or "/", safe="/%:@-._~!$&'()*+,;=")
-    normalized = urlunsplit((split.scheme.lower(), netloc, path, urlencode(query, doseq=True), ""))
-    redacted_query = urlencode([(k, redact_value(v) if TOKEN_KEYS.search(k) else v) for k, v in query], doseq=True).replace("%2A", "*").replace("%2a", "*")
-    redacted = urlunsplit((split.scheme.lower(), netloc, path, redacted_query, ""))
+    # Preserve query ordering/encoding and SPA fragments for navigation. They can
+    # be signed, and normalising them changes what the recipient actually opens.
+    normalized = urlunsplit((split.scheme.lower(), netloc, path, split.query, split.fragment))
+    redacted_query = urlencode([(k, redact_value(v) if sensitive_query(k,v) else v) for k, v in query], doseq=True).replace("%2A", "*").replace("%2a", "*")
+    redacted = urlunsplit((split.scheme.lower(), netloc, path, redacted_query, "[redacted]" if split.fragment else ""))
     return NormalizedUrl(value, normalized, ascii_host, unicode_host, reg, redacted, tuple(sorted(set(flags))))
 
 
@@ -138,3 +147,35 @@ def same_site(a: str | None, b: str | None) -> bool:
 
 def resolve_redirect(base: str, location: str) -> str:
     return urljoin(base, location)
+
+
+def ioc_url_key(raw: str) -> str:
+    item = normalize_url(raw)
+    split = urlsplit(item.normalized)
+    return urlunsplit((split.scheme, split.netloc, split.path, split.query, ""))
+
+
+def unwrap_url(raw: str) -> str | None:
+    """Decode documented link wrappers without requesting the wrapper itself."""
+    from urllib.parse import unquote
+    try:
+        item = normalize_url(raw)
+    except (ValueError, UnicodeError):
+        return None
+    split = urlsplit(item.normalized)
+    params = dict(parse_qsl(split.query, keep_blank_values=True))
+    target = None
+    if (item.host == "google.com" or item.host.endswith(".google.com")) and split.path == "/url":
+        target = params.get("q") or params.get("url")
+    elif item.host.endswith(".safelinks.protection.outlook.com"):
+        target = params.get("url")
+    elif item.host in {"vk.com", "m.vk.com"} and split.path == "/away.php":
+        target = params.get("to")
+    elif item.host == "www.google.com" and split.path.startswith("/amp/s/"):
+        target = "https://" + split.path[len("/amp/s/"):]
+    if target:
+        try:
+            return normalize_url(target).normalized
+        except ValueError:
+            return None
+    return None

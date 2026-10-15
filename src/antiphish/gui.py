@@ -17,11 +17,12 @@ class AntiPhishGui(tk.Tk):
         self.minsize(800, 560)
         self.analyzer = Analyzer()
         self.path = tk.StringVar()
-        self.network = tk.StringVar(value="offline")
+        self.network = tk.StringVar(value="http")
         self.profile = tk.StringVar(value="quality")
         self.status = tk.StringVar(value="Готов")
         self.mode_hint = tk.StringVar()
         self.last_report = None
+        self.running = False
         self._build()
 
     def _build(self):
@@ -34,7 +35,8 @@ class AntiPhishGui(tk.Tk):
         ttk.Combobox(top, textvariable=self.network, values=("offline", "http", "browser"), state="readonly", width=12).grid(row=1, column=1, sticky="w", padx=6, pady=(8, 0))
         ttk.Label(top, text="Профиль:").grid(row=1, column=1, sticky="e", padx=(0, 180), pady=(8, 0))
         ttk.Combobox(top, textvariable=self.profile, values=("fast", "quality", "deep"), state="readonly", width=12).grid(row=1, column=1, sticky="e", padx=6, pady=(8, 0))
-        ttk.Button(top, text="Анализировать", command=self.run_analysis).grid(row=1, column=2, pady=(8, 0))
+        self.analyze_button = ttk.Button(top, text="Анализировать", command=self.run_analysis)
+        self.analyze_button.grid(row=1, column=2, pady=(8, 0))
         ttk.Label(top, textvariable=self.mode_hint, foreground="#374151", wraplength=900).grid(row=2, column=0, columnspan=3, sticky="w", pady=(8, 0))
         top.columnconfigure(1, weight=1)
         self.profile.trace_add("write", self._update_mode_hint)
@@ -59,13 +61,13 @@ class AntiPhishGui(tk.Tk):
     def _update_mode_hint(self, *_):
         profiles = {
             "fast": "Fast: сокращённые лимиты, без QR и изображений внутри PDF.",
-            "quality": "Quality: полный статический разбор, QR и изображения документов.",
+            "quality": "Quality: полный разбор, QR, русский OCR и изображения документов.",
             "deep": "Deep: Quality + локальные Qwen/SigLIP; модель сама не блокирует.",
         }
         networks = {
             "offline": "Offline: ссылки не открываются.",
-            "http": "HTTP: до 5 извлечённых ссылок загружаются безопасным GET без JavaScript.",
-            "browser": "Browser: до 2 ссылок открываются в изолированном Edge с JavaScript.",
+            "http": "HTTP: цепочки переходов до 4 уровней, максимум 12 страниц, без JavaScript.",
+            "browser": "Browser: Edge с JavaScript и проверкой форм на тестовых данных; отправка блокируется.",
         }
         self.mode_hint.set(f"{profiles[self.profile.get()]} {networks[self.network.get()]}")
 
@@ -75,6 +77,8 @@ class AntiPhishGui(tk.Tk):
             self.path.set(value)
 
     def run_analysis(self):
+        if self.running:
+            return
         source_text = self.input_text.get("1.0", "end-1c")
         source = self.path.get().strip() or source_text.encode("utf-8")
         if not source:
@@ -90,17 +94,26 @@ class AntiPhishGui(tk.Tk):
         profile = self.profile.get()
         network = self.network.get()
         self.status.set("Анализ…")
+        self.running = True
+        self.analyze_button.configure(state="disabled")
         threading.Thread(target=self._worker, args=(source, confirmation, profile, network), daemon=True).start()
 
     def _worker(self, source, confirmation, profile, network):
-        name = "pasted.html" if isinstance(source, bytes) and b"<html" in source[:500].lower() else "pasted.eml"
+        from .utils import pasted_name
+        name = pasted_name(source) if isinstance(source,bytes) else None
         report = self.analyzer.analyze(source, name=name, profile=profile, network=network, browser_confirmation=confirmation)
         self.after(0, lambda: self._show(report))
 
     def _show(self, report):
+        self.running = False
+        self.analyze_button.configure(state="normal")
         self.last_report = report.to_dict()
         colors = {"PHISHING": "#fecaca", "SUSPICIOUS": "#fde68a", "NOT_DETECTED": "#bbf7d0"}
-        self.verdict.configure(text=f"{report.verdict.value} · {report.analysis_status.value}", bg=colors[report.verdict.value])
+        color = colors[report.verdict.value]
+        if report.verdict.value == "NOT_DETECTED" and (report.model_warnings or report.analysis_status.value != "COMPLETE" or report.configuration.get("network_analysis_status") in {"PARTIAL", "LIMITED", "RESTRICTED"}):
+            color = "#e5e7eb"
+        label = "АНАЛИЗ НЕ ВЫПОЛНЕН · FAILED" if report.analysis_status.value == "FAILED" else f"{report.verdict.value} · {report.analysis_status.value}"
+        self.verdict.configure(text=label, bg=color)
         for item in self.tree.get_children():
             self.tree.delete(item)
         config = self.tree.insert("", "end", text="Режим анализа", values=(report.configuration.get("profile_note", ""),), open=True)
@@ -124,6 +137,19 @@ class AntiPhishGui(tk.Tk):
         for warning in report.network_warnings:
             self.tree.insert(config, "end", text="Сетевая ошибка", values=(warning,))
         reasons = self.tree.insert("", "end", text="Причины", values=(len(report.reason_codes),), open=True)
+        reputation = self.tree.insert("", "end", text="Локальная репутация", values=(report.reputation.get("status", "EMPTY"),))
+        for source in report.reputation.get("sources", []):
+            self.tree.insert(reputation,"end",text=source["provider"],values=(f"{source['records']} URL; возраст {source['age_hours']} ч; устарела: {source['stale']}",))
+        routes = self.tree.insert("", "end", text="Переходы", values=(len(report.routes),))
+        for route in report.routes:
+            self.tree.insert(routes,"end",text=route["kind"],values=(f"{route.get('via')} → {route.get('url',route.get('to'))}",))
+        for warning in report.warnings:
+            self.tree.insert(config, "end", text="Ограничение разбора", values=(warning,))
+        pages = self.tree.insert("", "end", text="Страницы и получатели данных", values=(len(report.pages),))
+        for page in report.pages:
+            node = self.tree.insert(pages, "end", text=page.title or page.id, values=(f"{page.url or 'локальный объект'}; бренды: {', '.join(page.claimed_brands)}; источник: {page.identity_source}",))
+            for form in page.forms:
+                self.tree.insert(node, "end", text=", ".join(form.sensitive_types), values=(f"{form.method.upper()} → {form.destination or 'не установлен'}; отправка обнаружена: {form.collector_observed}",))
         for e in report.reason_codes:
             self.tree.insert(reasons, "end", text=e.code, values=(e.summary,))
         urls = self.tree.insert("", "end", text="URL", values=(len(report.urls),), open=True)
@@ -157,6 +183,8 @@ class AntiPhishGui(tk.Tk):
             f"{report.configuration.get('network_mode')} ({report.configuration.get('network_analysis_status')}) · "
             ""
         )
+        if report.analysis_status.value == "FAILED":
+            self.status.set("Ошибка анализа; подробности в ограничениях разбора")
 
     def save_json(self):
         if not self.last_report:

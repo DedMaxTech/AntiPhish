@@ -1,0 +1,20 @@
+services:
+  antiphish:
+    build: .
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - antiphish-data:/data
+      - ./models:/models:ro
+      - ./samples:/inputs:ro
+    read_only: true
+    tmpfs:
+      - /tmp:size=512m
+    shm_size: 512m
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    init: true
+    restart: unless-stopped
+volumes:
+  antiphish-data:

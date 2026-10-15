@@ -6,8 +6,8 @@
     "phishing_detected": 3,
     "phishing_missed": 0,
     "benign_phishing": 0,
-    "benign_suspicious": 1,
-    "benign_not_detected": 4
+    "benign_suspicious": 0,
+    "benign_not_detected": 5
   },
   "metrics": {
     "phishing_plus_suspicious_recall": 1.0,
@@ -46,12 +46,12 @@
     {
       "name": "login-demo.html",
       "label": "benign",
-      "verdict": "SUSPICIOUS",
+      "verdict": "NOT_DETECTED",
       "analysis_status": "COMPLETE",
       "reason_codes": [
         "SENSITIVE_FORM"
       ],
-      "correct": false
+      "correct": true
     },
     {
       "name": "forwarded.eml",
@@ -72,8 +72,7 @@
         "DISPLAY_HREF_MISMATCH",
         "SENSITIVE_FORM",
         "EXTERNAL_FORM_ACTION",
-        "REMOTE_FORM_SUBMISSION",
-        "SCRIPT_EXFILTRATION"
+        "PHISHING_FORM_ROUTE"
       ],
       "correct": true
     },
@@ -85,9 +84,7 @@
       "reason_codes": [
         "SENSITIVE_FORM",
         "EXTERNAL_FORM_ACTION",
-        "REMOTE_FORM_SUBMISSION",
-        "SCRIPT_EXFILTRATION",
-        "BRAND_DOMAIN_MISMATCH"
+        "PHISHING_FORM_ROUTE"
       ],
       "correct": true
     },
@@ -99,14 +96,12 @@
       "reason_codes": [
         "SENSITIVE_FORM",
         "EXTERNAL_FORM_ACTION",
-        "REMOTE_FORM_SUBMISSION",
-        "SCRIPT_EXFILTRATION",
-        "FAKE_DOCUMENT_VIEWER",
         "DOCUMENT_ACCESS_LURE",
-        "BRAND_DOMAIN_MISMATCH"
+        "FAKE_DOCUMENT_VIEWER",
+        "PHISHING_FORM_ROUTE"
       ],
       "correct": true
     }
   ],
-  "duration_ms": 137.65
+  "duration_ms": 197.99
 }

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import collections
+from functools import lru_cache
 from pathlib import Path
 
 from .config import RESOURCE_DIR
@@ -11,7 +12,14 @@ from .urltools import same_site
 
 
 def load_brands(path: Path | None = None) -> list[dict]:
-    payload = json.loads((path or RESOURCE_DIR / "brands.json").read_text(encoding="utf-8"))
+    source = path or RESOURCE_DIR / 'brands.json'
+    stat = source.stat()
+    return _load_cached(str(source), stat.st_size, stat.st_mtime_ns)
+
+
+@lru_cache(maxsize=8)
+def _load_cached(path, size, mtime):
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
     return [b for b in payload["brands"] if b.get("active") and b.get("domains") and len(b.get("references", [])) >= 2]
 
 
