@@ -5,7 +5,7 @@
 !MANIFEST.in
 !README.md
 !resources/
-!resources/*.json
+!resources/**
 !src/
 !src/**
 src/**/__pycache__/

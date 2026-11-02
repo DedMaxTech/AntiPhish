@@ -128,11 +128,11 @@ def iter_items(source: Path, limits, *, extensions=None, pattern="*"):
             yield Item(info.name, data, error)
 
 
-def run_batch(source: Path, analyzer: Analyzer, *, profile="quality", network="offline", browser_confirmation=None, output: Path | None = None, resume=False, extensions=None, pattern="*", store=None, progress=None) -> dict:
+def run_batch(source: Path, analyzer: Analyzer, *, profile="quality", network="offline", browser_confirmation=None, output: Path | None = None, resume=False, extensions=None, pattern="*", store=None, progress=None, options=None) -> dict:
     if output and Path(output).resolve() == Path(source).resolve():
         raise ValueError('Batch output must not overwrite its input')
     started = time.perf_counter()
-    settings = {"profile": profile, "network": network, "limits": repr(analyzer.limits), "runtime": manifest(analyzer.kb.path)}
+    settings = {"components":options or {}, "profile": profile, "network": network, "limits": repr(analyzer.limits), "runtime": manifest(analyzer.kb.path)}
     config_id = signature(settings)
     old = {}
     journal = Path(str(output) + '.jsonl') if output else None
@@ -173,6 +173,7 @@ def run_batch(source: Path, analyzer: Analyzer, *, profile="quality", network="o
             if identifier in old:
                 row = copy.deepcopy(old[identifier]); row['resumed'] = True
             else:
+                analysis = None
                 key = (digest, Path(item.name).suffix.lower())
                 duplicate = cache.get(key) if digest and not item.error else None
                 if item.error:
@@ -184,10 +185,13 @@ def run_batch(source: Path, analyzer: Analyzer, *, profile="quality", network="o
                     payload = copy.deepcopy(duplicate['report'])
                     payload['input']['name'] = Path(item.name).name
                 else:
-                    payload = analyzer.analyze(item.data, name=Path(item.name).name, profile=profile, network=network, browser_confirmation=browser_confirmation).to_dict()
+                    analysis = analyzer.analyze(item.data, name=Path(item.name).name, profile=profile, network=network, browser_confirmation=browser_confirmation, options=options)
+                    payload = analysis.to_dict()
                 row = {"id": identifier, "source": item.name, "sha256": digest, "config_id": config_id, "analyzed_at": datetime.now(timezone.utc).isoformat(), "resumed": False, "duplicate_of": duplicate['id'] if duplicate else None, "report": payload}
                 if store:
-                    row['report_id'] = store.put(payload, identifier)
+                    row['report_id'] = store.put(analysis or payload, identifier)
+                    if duplicate and duplicate.get('report_id'):
+                        store.clone_materials(duplicate['report_id'], row['report_id'])
                 if journal:
                     with journal.open('a', encoding='utf-8') as stream:
                         stream.write(json.dumps(row, ensure_ascii=False) + '\n')
@@ -205,6 +209,7 @@ def run_batch(source: Path, analyzer: Analyzer, *, profile="quality", network="o
               "statistics": {"items": len(rows), "resumed": sum(r['resumed'] for r in rows), "duplicates_reused": sum(bool(r.get('duplicate_of')) for r in rows), "elapsed_seconds": round(elapsed, 4), "items_per_minute": round(len(rows) * 60 / elapsed, 2) if elapsed else None, "p95_processing_ms": durations[min(len(durations)-1, int(.95 * len(durations)))] if durations else None,
                   "analysis_statuses": dict(Counter(r['report']['analysis_status'] for r in rows)), "verdicts": dict(Counter(r['report']['verdict'] for r in rows if r['report']['analysis_status'] != 'FAILED')), "network_statuses": dict(Counter(r['report']['configuration'].get('network_analysis_status', 'NOT_RUN') for r in rows))}, "results": rows}
     result['statistics']['reason_counts'] = dict(Counter(code for row in rows for code in {e['code'] for e in row['report']['reason_codes']}))
+    result['statistics']['decisive_reason_counts'] = dict(Counter(code for row in rows for code in {e['code'] for e in row['report']['configuration'].get('decision',{}).get('reasons',[])}))
     if output:
         atomic_json(Path(output), result)
     return result

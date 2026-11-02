@@ -47,7 +47,7 @@ def test_browser_redirects_keep_origin_and_block_submissions(monkeypatch):
     assert b'data-executed="final-fixture.example"' in result.body
     assert not any("/submit" in u or "wss:" in u for u in calls)
     assert any("non-GET" in w for w in result.warnings)
-    assert any("GET failed" in w for w in result.warnings)
+    assert any(r['url']=='http://127.0.0.1/private' and r['status']=='FAILED' for r in result.resource_observations)
 
 
 def test_http_charset_is_used_for_russian_page(empty_kb):

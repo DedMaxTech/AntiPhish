@@ -1,1 +1,5 @@
 include resources/*.json
+recursive-include resources/logo-gallery *.json *.jsonl *.png *.npz *.md
+recursive-include src/antiphish/web *.html *.css *.js
+recursive-include src/antiphish/licenses *.txt
+include THIRD_PARTY_NOTICES.md

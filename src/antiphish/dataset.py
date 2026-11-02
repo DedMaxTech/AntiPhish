@@ -108,7 +108,7 @@ def benchmark_dataset(archive_path: Path, analyzer: Analyzer, *, profile='qualit
                 if expected_hash and digest != expected_hash:
                     raise ValueError('Dataset checksum mismatch')
                 report = analyzer.analyze(data, name=Path(path).name, profile=profile, network=network, base_url=record.get('url') if Path(path).suffix.lower() in {'.html', '.htm'} else None)
-                row.update(verdict=report.verdict.value, status=report.analysis_status.value, network_status=report.configuration.get('network_analysis_status'), reasons=[e.code for e in report.reason_codes], ms=report.timings_ms.get('total'))
+                row.update(verdict=report.verdict.value, status=report.analysis_status.value, network_status=report.configuration.get('network_analysis_status'), reasons=[e.code for e in report.reason_codes], decisive_reasons=[e['code'] for e in report.configuration.get('decision',{}).get('reasons',[])], ms=report.timings_ms.get('total'))
             except (KeyError, ValueError, OSError, zipfile.BadZipFile) as exc:
                 # A corrupt/missing object remains a failed labelled trial;
                 # neither quietly drop it nor abort the remaining dataset.

@@ -1,29 +1,36 @@
+# Local environments and generated Python files
 .venv/
+venv/
 __pycache__/
 *.py[cod]
-.pytest_cache/
 *.egg-info/
-build/
-dist/
+.pytest_cache/
 .coverage
 htmlcov/
+build/
+dist/
+
+# Runtime data, private inputs, downloaded weights and local reports
+/artifacts/
+/reports/
+/models/
+/data/
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.db
+
+# Local settings and editor files
+.env
+.env.*
+!.env.example
 .idea/
 .vscode/
 *.log
 *.tmp
-models/Qwen3.5-4B/
-models/siglip2-base-patch16-224/
-models/ocr/
-reports/external-*.json
-artifacts/*.reputation.sqlite
-artifacts/*-wal
-artifacts/*-shm
-.env
-reports/history.sqlite*
-artifacts/*.domains.sqlite*
-reports/revision-2026-10/
-data/private/
-models/logo-references/
-models/logo-index.npz
-models/logo-index.json
-models/phishing-scam-detector-base/
+~$*
+/test.json
+
+# Presentation builds and private demonstrations live outside the repository
+/presentation/
+/demo/

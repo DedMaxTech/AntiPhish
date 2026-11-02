@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from functools import lru_cache
+
 import ipaddress
 import re
 import socket
@@ -115,12 +117,21 @@ def normalize_url(raw: str) -> NormalizedUrl:
     # be signed, and normalising them changes what the recipient actually opens.
     normalized = urlunsplit((split.scheme.lower(), netloc, path, split.query, split.fragment))
     redacted_query = urlencode([(k, redact_value(v) if sensitive_query(k,v) else v) for k, v in query], doseq=True).replace("%2A", "*").replace("%2a", "*")
-    redacted = urlunsplit((split.scheme.lower(), netloc, path, redacted_query, "[redacted]" if split.fragment else ""))
+    redacted_path = re.sub(r'(?i)(/bot)\d+:[\w-]+', r'\1[redacted]', path) if ascii_host == 'api.telegram.org' else path
+    secret_fragment = bool(split.fragment and (TOKEN_KEYS.search(split.fragment) or len(split.fragment)>24 or 'TOKENIZED_URL' in flags))
+    redacted = urlunsplit((split.scheme.lower(), netloc, redacted_path, redacted_query, "[redacted]" if secret_fragment else split.fragment))
     return NormalizedUrl(value, normalized, ascii_host, unicode_host, reg, redacted, tuple(sorted(set(flags))))
 
 
 def extract_urls(text: str) -> list[str]:
     return [m.group(0).rstrip(".,;:!?)\"]}") for m in URL_RE.finditer(text)]
+
+
+def auxiliary_link(item) -> bool:
+    """Footer/privacy destinations do not substantiate a credential/reward CTA."""
+    from .navigation import service_reason,RESOURCE_SUFFIXES
+    path=urlsplit(item.navigation_url or item.normalized or '').path.lower()
+    return bool(service_reason(item) or any(path.endswith(s) for s in RESOURCE_SUFFIXES))
 
 
 def is_public_host(host: str) -> tuple[bool, list[str]]:
@@ -155,6 +166,13 @@ def ioc_url_key(raw: str) -> str:
     return urlunsplit((split.scheme, split.netloc, split.path, split.query, ""))
 
 
+@lru_cache(maxsize=1)
+def _google_domains():
+    import json
+    from .config import RESOURCE_DIR
+    return frozenset(json.loads((RESOURCE_DIR/'link_wrappers.json').read_text(encoding='utf-8'))['google_domains'])
+
+
 def unwrap_url(raw: str) -> str | None:
     """Decode documented link wrappers without requesting the wrapper itself."""
     from urllib.parse import unquote
@@ -165,14 +183,20 @@ def unwrap_url(raw: str) -> str | None:
     split = urlsplit(item.normalized)
     params = dict(parse_qsl(split.query, keep_blank_values=True))
     target = None
-    if (item.host == "google.com" or item.host.endswith(".google.com")) and split.path == "/url":
+    if item.registered_domain in _google_domains() and split.path == "/url":
         target = params.get("q") or params.get("url")
+    elif item.host in {'googleads.g.doubleclick.net','www.googleadservices.com','googleadservices.com'} and split.path in {'/pcs/click','/pagead/aclk','/aclk'}:
+        target = params.get('adurl')
     elif item.host.endswith(".safelinks.protection.outlook.com"):
         target = params.get("url")
     elif item.host in {"vk.com", "m.vk.com"} and split.path == "/away.php":
         target = params.get("to")
     elif item.host == "www.google.com" and split.path.startswith("/amp/s/"):
         target = "https://" + split.path[len("/amp/s/"):]
+    elif item.host in {'avito.ru','www.avito.ru'} and split.path=='/extended-profile/switch':
+        target=params.get('then')
+    elif item.host in {'avito.ru','www.avito.ru'} and split.path=='/mailStat/click':
+        target=params.get('redirect')
     if target:
         try:
             return normalize_url(target).normalized

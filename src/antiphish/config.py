@@ -17,6 +17,12 @@ REPORT_DIR = DATA_ROOT / "reports"
 DEFAULT_KB = ARTIFACT_DIR / "knowledge.sqlite"
 
 
+def logo_index_path() -> Path:
+    """Prefer the operator's gallery; otherwise use the bundled reviewed set."""
+    local = MODEL_DIR / 'logo-index.npz'
+    return local if local.is_file() else RESOURCE_DIR / 'logo-gallery' / 'logo-index.npz'
+
+
 @dataclass(frozen=True, slots=True)
 class Limits:
     max_input_bytes: int = 50 * 1024 * 1024

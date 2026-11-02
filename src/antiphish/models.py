@@ -34,6 +34,7 @@ class Evidence:
     source: str | None = None
     independent_group: str = "generic"
     scope_id: str | None = None
+    context: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -50,6 +51,8 @@ class UrlFinding:
     scope_id: str | None = None
     navigation_url: str | None = field(default=None, repr=False, metadata={"private": True})
     depth: int = 0
+    navigation_role: str | None = None
+    selection_reason: str | None = None
 
 
 @dataclass(slots=True)
@@ -80,8 +83,18 @@ class PageFinding:
     identity_source: str = "dom"
     resources: list[dict[str, Any]] = field(default_factory=list)
     screenshot_sha256: str | None = None
+    image_source_url: str | None = None
+    image_role: str | None = None
+    visual_images: list[dict[str, Any]] = field(default_factory=list,repr=False,metadata={"private":True})
+    render_assets: dict[str,str] = field(default_factory=dict,repr=False,metadata={"private":True})
+    resource_urls: dict[str,str] = field(default_factory=dict,repr=False,metadata={"private":True})
+    visual_exclusions: list = field(default_factory=list,repr=False,metadata={"private":True})
     text: str = field(default="", repr=False, metadata={"private": True})
     identity_text: str = field(default="", repr=False, metadata={"private": True})
+    source_html: str = field(default="", repr=False, metadata={"private": True})
+    image_bytes: bytes = field(default=b"", repr=False, metadata={"private": True})
+    dom_signature: str | None = field(default=None,repr=False,metadata={"private":True})
+    legacy_dom_signature: str | None = field(default=None,repr=False,metadata={"private":True})
 
 
 @dataclass(slots=True)
@@ -124,6 +137,13 @@ class AnalysisReport:
     network_warnings: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     timings_ms: dict[str, float] = field(default_factory=dict)
+    message: dict[str, Any] = field(default_factory=dict)
+    review: dict[str, Any] = field(default_factory=dict)
+    source_bytes: bytes = field(default=b"", repr=False, metadata={"private": True})
+    learning_pages: list[dict] = field(default_factory=list, repr=False, metadata={"private": True})
+    learning_signature: dict = field(default_factory=dict, repr=False, metadata={"private": True})
+    learning_message: str = field(default='',repr=False,metadata={"private":True})
+    model_image: bytes = field(default=b'',repr=False,metadata={"private":True})
 
     def to_dict(self) -> dict[str, Any]:
         return _enum_values(_public_dataclass(self))

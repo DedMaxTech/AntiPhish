@@ -151,14 +151,15 @@ def extract_eml(data: bytes, limits: Limits, depth: int = 0, quality: bool = Tru
     return_domain = _address_domain(headers.get("return-path", ""))
     result.metadata.update(from_domain=from_domain, reply_to_domain=reply_domain, return_path_domain=return_domain)
     if from_domain and reply_domain and not same_site(from_domain, reply_domain):
-        result.evidence.append(_evidence("FROM_REPLYTO_MISMATCH", Severity.MEDIUM, "From и Reply-To относятся к разным доменам", "sender", from_domain=from_domain, reply_to_domain=reply_domain))
+        result.evidence.append(_evidence("FROM_REPLYTO_MISMATCH", Severity.MEDIUM, "From и Reply-To относятся к разным доменам", "sender", from_domain=from_domain, reply_to_domain=reply_domain,header_context={k:headers.get(k,'') for k in ('from','reply-to')},source_sha256=result.sha256))
     if from_domain and return_domain and not same_site(from_domain, return_domain):
-        result.evidence.append(_evidence("FROM_RETURNPATH_MISMATCH", Severity.LOW, "From и Return-Path относятся к разным доменам", "sender", from_domain=from_domain, return_path_domain=return_domain))
+        result.evidence.append(_evidence("FROM_RETURNPATH_MISMATCH", Severity.LOW, "From и Return-Path относятся к разным доменам", "sender", from_domain=from_domain, return_path_domain=return_domain,header_context={k:headers.get(k,'') for k in ('from','return-path')},source_sha256=result.sha256))
     if AUTH_FAIL.search(headers.get("authentication-results", "")):
-        result.evidence.append(_evidence("AUTHENTICATION_FAILURE", Severity.MEDIUM, "Заголовки сообщают об ошибке SPF/DKIM/DMARC", "sender", result=bounded_text(headers.get("authentication-results", ""), 500)))
+        result.evidence.append(_evidence("AUTHENTICATION_FAILURE", Severity.MEDIUM, "Заголовки сообщают об ошибке SPF/DKIM/DMARC", "sender", result=bounded_text(headers.get("authentication-results", ""), 500),header_context={'authentication-results':headers.get('authentication-results','')},source_sha256=result.sha256))
 
     plain_parts: list[str] = []
     html_parts: list[tuple[bytes, str | None]] = []
+    body_plain=[];body_html=[];body_scopes=[]
     for part in _leaf_parts(msg):
         if part.get_content_type() == "message/rfc822":
             children = part.get_payload()
@@ -179,18 +180,33 @@ def extract_eml(data: bytes, limits: Limits, depth: int = 0, quality: bool = Tru
             result.warnings.append(f"Part {part.get_filename() or part.get_content_type()} exceeds size limit")
             continue
         ctype = part.get_content_type().lower()
+        cid=part.get('Content-ID','').strip('<> ')
+        if cid and ctype in {'image/png','image/jpeg','image/gif','image/webp','image/svg+xml'} and len(payload)<=3*1024*1024:
+            import base64
+            images=result.metadata.setdefault('cid_images',{})
+            if len(images)<6:images['cid:'+cid]='data:'+ctype+';base64,'+base64.b64encode(payload).decode('ascii')
+        location=part.get('Content-Location','').strip()
+        if location and ctype in {'image/png','image/jpeg','image/gif','image/webp','image/svg+xml'} and len(payload)<=3*1024*1024:
+            import base64
+            images=result.metadata.setdefault('cid_images',{})
+            if len(images)<12:images[location]='data:'+ctype+';base64,'+base64.b64encode(payload).decode('ascii')
         if ctype in {"application/pkcs7-mime","application/x-pkcs7-mime","application/pgp-encrypted"}:
             result.warnings.append("Encrypted email content cannot be inspected without decryption")
         disposition = part.get_content_disposition()
         filename = part.get_filename()
         if ctype == "text/plain" and disposition != "attachment":
-            plain_parts.append(_decode_part(payload, part))
+            decoded_part=_decode_part(payload, part)
+            plain_parts.append(decoded_part);body_plain.append(decoded_part)
         elif ctype == "text/html" and disposition != "attachment":
             html_parts.append((payload, part.get_content_charset()))
         elif filename or disposition == "attachment" or ctype.startswith("image/"):
             name = bounded_text(filename or f"part-{len(result.attachments)+1}", 240)
             child = extract_any(payload, name, ctype, limits, depth + 1, quality=quality)
             finding = AttachmentFinding(name=name, media_type=ctype, size=len(payload), sha256=sha256_bytes(payload), status="PARTIAL" if child.warnings else "ANALYZED", evidence_codes=sorted({e.code for e in child.evidence}))
+            result.fingerprints.setdefault('attachment_fingerprints',[]).append({'name':name,'sha256':finding.sha256,'fingerprints':child.fingerprints})
+            for observation in child.evidence:
+                observation.details.setdefault('attachment',name)
+                observation.details.setdefault('attachment_sha256',finding.sha256)
             result.attachments.append(finding)
             result.urls.extend(child.urls)
             result.pages.extend(child.pages)
@@ -201,6 +217,8 @@ def extract_eml(data: bytes, limits: Limits, depth: int = 0, quality: bool = Tru
     result.text = bounded_text("\n".join(plain_parts), limits.max_text_chars)
     for body, encoding in html_parts:
         child = extract_html(body, limits, encoding=encoding)
+        body_html.append(child.text)
+        if child.pages:body_scopes.append(child.pages[0].id)
         result.text = bounded_text(result.text + "\n" + child.text, limits.max_text_chars)
         result.html_text = bounded_text(result.html_text + "\n" + child.html_text, limits.max_text_chars)
         result.urls.extend(child.urls)
@@ -208,6 +226,13 @@ def extract_eml(data: bytes, limits: Limits, depth: int = 0, quality: bool = Tru
         result.evidence.extend(child.evidence)
         result.fingerprints.setdefault("html_parts", []).append(child.fingerprints)
         result.warnings.extend(child.warnings)
+    primary='\n'.join(body_html).strip() or '\n'.join(body_plain).strip()
+    plain='\n'.join(body_plain).strip()
+    if body_html and plain:
+        a=set(re.findall(r'\w+',primary.casefold()));b=set(re.findall(r'\w+',plain.casefold()))
+        if b and len(b-a)/len(b)>.35 and len(plain)>80:primary+='\n\nТекстовая версия письма:\n'+plain
+    result.metadata['message_text']=bounded_text(primary,limits.max_text_chars)
+    result.metadata['message_body_scopes']=body_scopes
     for url in extract_urls(result.text)[: limits.max_urls]:
         _append_url(result, url, "text")
     if BEC_TERMS.search((headers.get("subject", "") + " " + result.text)):
@@ -326,6 +351,12 @@ def extract_pdf(data: bytes, limits: Limits, quality: bool = True) -> Extracted:
                     image_count += 1
                 except Exception:
                     continue
+            from .options import enabled
+            if quality and enabled('visual_brands',False) and enabled('render_local',False) and not scanned and page_index<3:
+                scale=min(2,1800/max(page.rect.width,page.rect.height,1))
+                before=len(result.pages)
+                _merge_image(result,page.get_pixmap(matrix=fitz.Matrix(scale,scale),alpha=False).tobytes('png'),f'pdf:render-page-{page_index+1}')
+                for view in result.pages[before:]:view.image_role='pdf-render'
         result.text = bounded_text("\n".join(texts) + "\n" + result.text, limits.max_text_chars)
         result.metadata["page_count"] = doc.page_count
         doc.close()
@@ -418,12 +449,26 @@ def _merge_image(result: Extracted, data: bytes, source: str, decode_qr: bool = 
         if original.width * original.height > 30_000_000:
             result.warnings.append("Image analysis skipped due to pixel limit")
             return
-        image = original.convert("RGB")
+        from .deep import rgb_image
+        image = rgb_image(original)
         result.fingerprints.setdefault("image_phash", []).append(_phash(image))
+        from .options import enabled
+        visual_requested=any(enabled(k,False) for k in ('llm','siglip','logo_references','visual_brands'))
+        def keep_visual():
+            if min(image.size)<8 or image.width*image.height<256:
+                return  # Tracking pixels are neither logos nor screenshots.
+            digest=sha256_bytes(data)
+            if not any(p.sha256==digest for p in result.pages):
+                preview=image.copy();preview.thumbnail((1600,1600))
+                buffer=io.BytesIO();preview.save(buffer,'PNG')
+                page=PageFinding('image:'+digest[:20],digest,title='Изображение: '+source,identity_source='image')
+                page.image_bytes=buffer.getvalue();result.pages.append(page)
         if not decode_qr:
+            if visual_requested: keep_visual()
             return
         from .ocr import recognize
-        text, ocr_status = recognize(image)
+        from .options import enabled
+        text, ocr_status = recognize(image) if enabled('ocr') else ('','DISABLED')
         result.metadata.setdefault("ocr", []).append({"source": source, "status": ocr_status})
         if ocr_status in {"UNAVAILABLE", "LIMITED"} or ocr_status.startswith("FAILED:"):
             warning = "Image text inspection: " + ocr_status
@@ -433,6 +478,11 @@ def _merge_image(result: Extracted, data: bytes, source: str, decode_qr: bool = 
             digest = sha256_bytes(data)
             scope = "image:" + digest[:20]
             page = PageFinding(scope, digest, title=" ".join(text.splitlines()[:3])[:240], text=text, identity_text=text[:1200], identity_source="ocr")
+            preview = image.copy()
+            preview.thumbnail((1600, 1600))
+            preview_buffer = io.BytesIO()
+            preview.save(preview_buffer, 'PNG')
+            page.image_bytes = preview_buffer.getvalue()
             result.pages.append(page)
             result.text = bounded_text(result.text + "\n" + text, 2_000_000)
             result.evidence.append(Evidence("OCR_TEXT_EXTRACTED", Severity.INFO, "Распознан текст изображения локальной моделью с кириллицей", {"source": source, "characters": len(text), "blocking": False}, independent_group="visual", scope_id=scope))
@@ -445,15 +495,25 @@ def _merge_image(result: Extracted, data: bytes, source: str, decode_qr: bool = 
             result.warnings.append("Image QR scan skipped due to pixel limit")
             return
         from .qr import decode
-        decoded = decode(image)
+        decoded = decode(image) if enabled("qr") else []
+        if decoded and not text:
+            digest = sha256_bytes(data)
+            scope = 'image:' + digest[:20]
+            page = PageFinding(scope,digest,title='Изображение с QR-кодом',identity_source='image')
+            preview = image.copy()
+            preview.thumbnail((1600,1600))
+            preview_buffer = io.BytesIO()
+            preview.save(preview_buffer,'PNG')
+            page.image_bytes = preview_buffer.getvalue()
+            result.pages.append(page)
         for value in decoded[:20]:
             if value.lower().startswith(("http://", "https://")):
                 old_scope = result.metadata.get("scope_id")
-                if text:
-                    result.metadata["scope_id"] = scope
+                result.metadata["scope_id"] = scope
                 _append_url(result, value, f"qr:{source}")
                 result.metadata["scope_id"] = old_scope
-                result.evidence.append(_evidence("QR_EXTERNAL_DESTINATION", Severity.MEDIUM, "QR-код содержит веб-адрес", "qr", destination=normalize_url(value).redacted))
+                result.evidence.append(Evidence("QR_EXTERNAL_DESTINATION", Severity.INFO, "QR-код содержит веб-адрес", {"destination":normalize_url(value).redacted,"source":source}, independent_group='qr',scope_id=scope))
+        if visual_requested: keep_visual()
     except Exception as exc:
         result.warnings.append(f"Image analysis failed: {type(exc).__name__}")
 
@@ -501,6 +561,20 @@ def extract_any(data: bytes, name: str, media_type: str | None, limits: Limits, 
         return extract_office(data, name, limits)
     if data.startswith(b"PK\x03\x04"):
         return extract_archive(data, limits, depth, quality)
+    if lower.endswith('.svg') or ctype=='image/svg+xml':
+        from lxml import etree
+        import base64
+        result=Extracted(kind='image',sha256=sha256_bytes(data),size=len(data))
+        try:
+            if len(data)>2*1024*1024 or re.search(rb'<!DOCTYPE|<!ENTITY',data,re.I):raise ValueError('Unsafe SVG')
+            root=etree.fromstring(data,parser=etree.XMLParser(resolve_entities=False,no_network=True))
+            if etree.QName(root).localname!='svg':raise ValueError('Not SVG')
+            text=' '.join(root.xpath('//*[local-name()="text" or local-name()="tspan"]/text()'))[:12000]
+            page=PageFinding('image:'+result.sha256[:20],result.sha256,identity_source='image',text=text)
+            page.source_html='<html><body><img src="data:image/svg+xml;base64,'+base64.b64encode(data).decode('ascii')+'"></body></html>'
+            result.pages.append(page);result.text=text
+        except Exception as exc:result.warnings.append('SVG analysis: '+type(exc).__name__)
+        return result
     if lower.endswith((".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tif", ".tiff")) or ctype.startswith("image/"):
         return extract_image(data, limits, quality=quality)
     result = Extracted(kind="binary", sha256=sha256_bytes(data), size=len(data))

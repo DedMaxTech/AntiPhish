@@ -1,6 +1,17 @@
 """Stable, documented reason codes used by CLI, GUI and integrations."""
 
 REASON_DESCRIPTIONS = {
+    'FAKE_BROWSER_ADDRESS':'A secret collector renders another site address in a fake in-page browser address bar',
+    'SECRET_REPLY_REQUEST':'Direct request to send a password, OTP or seed to another person',
+    'CLICKFIX_EXECUTION':'Verification instructions ask to paste a network/system execution command',
+    'UPFRONT_PAYOUT_FEE':'A cash payout is conditioned on a preliminary fee payment',
+    'SAFE_ACCOUNT_TRANSFER':'Instruction to move money to a supposedly safe account',
+    'REMOTE_BANK_CONTROL':'Bank-safety pretext requests remote control software and access code',
+    'SECRET_TO_PUBLIC_FORM':'A secret collector submits to a public survey/contact form service',
+    'BRANDED_SECRET_INSTRUCTION':'Direct secret request names a brand and a nearby action URL outside its authentication domains; review only',
+    'BRAND_HOMOGRAPH':'Unicode domain skeleton matches a curated official brand domain; observation only',
+    'LOOKALIKE_SECRET_FORM':'A confirmed secret collector is on a Unicode lookalike of a curated brand domain; review only',
+    'VISUAL_BRAND_AUTH_MISMATCH':'Localized reference logo and secret collector outside that brand domains; review only',
     "IOC_SHA256_MATCH": "Exact match of a confirmed malicious object",
     "SENSITIVE_FORM": "Form requests credentials, payment data, OTP or a seed phrase",
     "EXTERNAL_FORM_ACTION": "Sensitive form submits to an unrelated site",
@@ -56,6 +67,11 @@ REASON_DESCRIPTIONS = {
 
 
 def catalog() -> list[dict]:
-    blocking = {'IOC_SHA256_MATCH', 'KNOWN_BAD_URL', 'PHISHING_FORM_ROUTE'}
+    REASON_DESCRIPTIONS.update(REVIEWED_PHISHING_SAMPLE='Exact match to a manually confirmed phishing input',
+        REVIEWED_BENIGN_SAMPLE='Exact reviewed benign input; independent evidence is still evaluated',
+        REVIEWED_MESSAGE_SIMILARITY='Close reviewed message text/subject with a non-official brand destination',
+        SECRET_TO_MESSAGING_API='Observed form sends a password or secret to a messaging API')
+    from .policy import BLOCKING_CODES
+    blocking = BLOCKING_CODES
     informational = {'ANALYSIS_INCOMPLETE', 'KNOWN_SAMPLE_MATCH', 'OCR_TEXT_EXTRACTED', 'QR_EXTERNAL_DESTINATION'}
     return [{'code': code, 'description': description, 'policy_role': 'blocking-proof' if code in blocking else 'observation' if code in informational else 'context-or-review; inspect scoped policy'} for code, description in sorted(REASON_DESCRIPTIONS.items())]

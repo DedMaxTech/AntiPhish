@@ -74,7 +74,11 @@ def replay_fetch(pages):
     return fetch
 
 
-def benchmark_corpus(path: Path, *, max_items=None, output=None, progress=None, profile="quality"):
+def _russian_brand(brand):
+    return bool(re.search(r"[А-Яа-яЁё]",brand) or brand.casefold() in {"wildberries","ozon","mailru","moc ру","dsl.su","drweb","pony express"})
+
+
+def benchmark_corpus(path: Path, *, max_items=None, output=None, progress=None, profile="quality", russian_only=False):
     """No runtime IOC/sample fitting. Separate mail, reached route and captures."""
     rows = []
     with tempfile.TemporaryDirectory(prefix="antiphish-eval-") as temp:
@@ -82,24 +86,26 @@ def benchmark_corpus(path: Path, *, max_items=None, output=None, progress=None, 
         initialize_empty_kb(kb)
         analyzer = Analyzer(kb)
         for index, sample in enumerate(read_corpus(path)):
-            if max_items is not None and index >= max_items:
+            if russian_only and not _russian_brand(sample.brand):continue
+            if max_items is not None and len(rows) >= max_items:
                 break
             static = analyzer.analyze(sample.mail, name="capture.eml", profile=profile)
             replay = analyzer.analyze(sample.mail, name="capture.eml", profile=profile, network="http", fetcher=replay_fetch(sample.pages))
             captured = [analyzer.analyze(page.body, name="capture.html", base_url=page.final_url, profile=profile) for page in sample.pages.values()]
             family = hashlib.sha256("|".join(sorted(p.sha256 for r in captured for p in r.pages)).encode()).hexdigest()[:16]
             rows.append({"id":sample.id, "brand":sample.brand, "family":family, "label":"provider-phishing-unreviewed", "mail":static.verdict.value, "route":replay.verdict.value, "mail_status":static.analysis_status.value, "route_status":replay.analysis_status.value, "network_status":replay.configuration["network_analysis_status"], "captures":[r.verdict.value for r in captured], "capture_statuses":[r.analysis_status.value for r in captured], "route_codes":sorted({e.code for e in replay.reason_codes}), "capture_codes":[sorted({e.code for e in r.reason_codes}) for r in captured], "reached_pages":len(replay.pages)-len(static.pages), "available_pages":len(sample.pages)})
-            if progress and (index + 1) % 25 == 0:
-                progress(index + 1)
-            if output and (index + 1) % 25 == 0:
+            if progress and len(rows) % 25 == 0:
+                progress(len(rows))
+            if output and len(rows) % 25 == 0:
                 output.parent.mkdir(parents=True, exist_ok=True)
                 output.write_text(json.dumps({"status":"RUNNING", "rows":rows}, ensure_ascii=False), encoding="utf-8")
-    russian = [r for r in rows if re.search(r"[А-Яа-яЁё]",r["brand"]) or r["brand"].casefold() in {"wildberries","ozon","mailru","moc ру","dsl.su","drweb","pony express"}]
+    russian = [r for r in rows if _russian_brand(r['brand'])]
 
     def metrics(items):
         return {"emails":len(items), "mail_verdicts":dict(collections.Counter(r["mail"] for r in items)), "route_verdicts":dict(collections.Counter(r["route"] for r in items)), "capture_verdicts":dict(collections.Counter(v for r in items for v in r["captures"])), "mail_statuses":dict(collections.Counter(r["mail_status"] for r in items)), "route_statuses":dict(collections.Counter(r["route_status"] for r in items)), "network_statuses":dict(collections.Counter(r["network_status"] for r in items)), "capture_statuses":dict(collections.Counter(v for r in items for v in r["capture_statuses"])), "available_captures":sum(r["available_pages"] for r in items), "reached_pages":sum(r["reached_pages"] for r in items), "brands":dict(collections.Counter(r["brand"] for r in items))}
     result = {"schema_version":"2.0", "corpus":path.name, "network":"recorded-only", "knowledge_base":"empty", "labels":"provider labels; landing/error/legitimate captured pages are not assumed phishing", "family_field":"exact capture-set fingerprint, not a verified campaign or an independent test split", "evaluation_scope":"exploratory corpus used during development; not held-out production recall", "all":metrics(rows), "russian":metrics(russian), "rows":rows}
     result["profile"] = profile
+    result['selection']={'russian_brand_labels_only':russian_only,'max_items':max_items,'language_is_inferred_from_brand_label':True}
     if output:
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")

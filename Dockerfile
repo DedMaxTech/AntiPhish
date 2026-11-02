@@ -13,7 +13,7 @@ RUN python -c "import tomllib,os; p=tomllib.load(open('pyproject.toml','rb'))['p
     && mkdir -p /data /models && chown analyst:analyst /data /models
 COPY src ./src
 COPY resources ./resources
-COPY setup.py MANIFEST.in README.md ./
+COPY setup.py MANIFEST.in README.md LICENSE THIRD_PARTY_NOTICES.md ./
 RUN pip install --no-deps .
 USER analyst
 EXPOSE 8000

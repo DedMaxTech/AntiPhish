@@ -30,7 +30,8 @@ def reset_budget():
 def status():
     present = {key: (OCR_DIR / Path(relative).name).is_file() for key, (relative, _) in MODELS.items()}
     installed = importlib.util.find_spec("rapidocr") is not None
-    return {"ready": installed and all(present.values()), "runtime_installed": installed, "models": present, "directory": str(OCR_DIR), "languages": "Cyrillic including Russian, plus Latin", "runtime_network": False}
+    return {"ready": installed and all(present.values()), "runtime_installed": installed, "models": present, "directory": str(OCR_DIR), "languages": "Cyrillic including Russian, plus Latin", "runtime_network": False,
+            "backend":"RapidOCR / ONNX Runtime", "detector":"PP-OCRv5 mobile", "recognizer":"PP-OCRv5 Cyrillic mobile", "device":"CPU", "spatial_output":True}
 
 
 def setup_models(progress=None):
@@ -82,20 +83,26 @@ def _engine():
     })
 
 
-def recognize(image):
-    """Return text/status without downloading absent models implicitly."""
+def recognize_layout(image):
+    """Text and polygons in original image coordinates; no implicit downloads."""
+    def output(text,status,lines=None):return {'text':text,'status':status,'lines':lines or []}
     if image.width < 120 or image.height < 40:
-        return "", "TOO_SMALL"
+        return output('', 'TOO_SMALL')
     budget = _budget.get()
     if budget is None:
         reset_budget()
         budget = _budget.get()
     if budget["count"] >= 6 or budget["seconds"] >= 12:
-        return "", "LIMITED"
+        return output('', 'LIMITED')
     if not status()["ready"]:
-        return "", "UNAVAILABLE"
+        return output('', 'UNAVAILABLE')
     import numpy as np
+    original_size=image.size
     image = image.copy()
+    if image.mode in {'RGBA','LA'} or 'transparency' in image.info:
+        from PIL import Image
+        background=Image.new('RGBA',image.size,'white')
+        background.alpha_composite(image.convert('RGBA'));image=background.convert('RGB')
     image.thumbnail((1800, 1800))
     started = time.monotonic()
     budget["count"] += 1
@@ -105,9 +112,26 @@ def recognize(image):
         texts = getattr(result, "txts", None)
         scores = getattr(result, "scores", None)
         if texts is None:
-            return "", "COMPLETE"
-        return "\n".join(text for text, score in zip(texts, scores) if score >= .65)[:12000], "COMPLETE"
+            return output('', 'COMPLETE')
+        boxes=getattr(result,'boxes',None)
+        lines=[]
+        for i,(text,score) in enumerate(zip(texts,scores)):
+            if score<.65:continue
+            line={'text':text[:1000],'score':round(float(score),5)}
+            if boxes is not None and i<len(boxes):
+                polygon=np.asarray(boxes[i],dtype=float)
+                if polygon.shape==(4,2) and np.isfinite(polygon).all():
+                    polygon*=np.array([original_size[0]/image.width,original_size[1]/image.height])
+                    line['polygon']=polygon.round(1).tolist()
+                    line['roi']=[int(polygon[:,0].min()),int(polygon[:,1].min()),int(polygon[:,0].max()),int(polygon[:,1].max())]
+            lines.append(line)
+        return output('\n'.join(line['text'] for line in lines)[:12000],'COMPLETE',lines[:150])
     except Exception as exc:
-        return "", "FAILED:" + type(exc).__name__
+        return output('', 'FAILED:' + type(exc).__name__)
     finally:
         budget["seconds"] += time.monotonic() - started
+
+
+def recognize(image):
+    result=recognize_layout(image)
+    return result['text'],result['status']

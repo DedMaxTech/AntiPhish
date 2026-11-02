@@ -15,7 +15,7 @@ def probe_forms(page, prepare, deadline):
     """Use only synthetic input; no backend-dependent step can succeed here."""
     markers = {}
     nonce = secrets.token_hex(8)
-    values = {"email": "antiphish-" + nonce + "@example.invalid", "password": "AntiPhish-" + nonce + "!", "otp": str(secrets.randbelow(900000) + 100000)}
+    values = {"email": "probe-" + nonce + "@example.invalid", "password": secrets.token_urlsafe(20), "otp": str(secrets.randbelow(900000) + 100000)}
     body, screenshot = page.content().encode("utf-8"), b""
     origin = page.url
     steps = 0
@@ -65,13 +65,14 @@ def probe_forms(page, prepare, deadline):
         for _, typ in candidates:
             markers[values[typ]] = typ
         prepare(dict(markers), origin, " ".join(identity)[:1200], str(fi))
+        try:
+            if not screenshot:
+                screenshot = page.screenshot(type="png", timeout=1500, animations="disabled")
+        except Exception:
+            pass
         for field, typ in candidates:
             field.fill(values[typ], timeout=1500)
         body = page.content().encode("utf-8")
-        try:
-            screenshot = page.screenshot(type="png", timeout=1500, animations="disabled")
-        except Exception:
-            pass
         try:
             button.click(timeout=1500, no_wait_after=True)
             page.wait_for_timeout(200)
@@ -82,4 +83,8 @@ def probe_forms(page, prepare, deadline):
             current = page.content().encode("utf-8")
             if current:
                 body = current
+    # A site may reflect our probe values into its DOM. They are measurements,
+    # never attacker evidence for OCR/LLM or the user-facing page excerpt.
+    for typ,value in values.items():
+        body=body.replace(value.encode(),('[SYNTHETIC_'+typ.upper()+']').encode())
     return body, screenshot, steps

@@ -28,14 +28,15 @@ def parser() -> argparse.ArgumentParser:
     sub = root.add_subparsers(dest="command", required=True)
     analyze = sub.add_parser("analyze", help="проанализировать файл, URL или stdin")
     analyze.add_argument("source", help="путь, URL или -")
-    analyze.add_argument("--profile", choices=("fast", "quality", "deep"), default="quality")
+    analyze.add_argument("--profile", choices=("fast", "quality", "deep", "custom"), default="quality")
+    analyze.add_argument('--options-file',type=Path,help='JSON переключателей компонентов и сетевых лимитов')
     analyze.add_argument("--network", choices=("offline", "http", "browser"), default="http")
     analyze.add_argument("--confirm-browser-risk")
     analyze.add_argument("--json", action="store_true")
     analyze.add_argument("--output", type=Path)
     analyze.add_argument("--kb", type=Path, default=DEFAULT_KB)
     analyze.add_argument('--persist', action='store_true', help='сохранить отчёт в локальной истории')
-    gui = sub.add_parser("gui", help="открыть демонстрационный GUI")
+    gui = sub.add_parser("gui", help="открыть локальный веб-интерфейс с историей и разметкой образцов")
     build = sub.add_parser("build-kb", help="построить KB напрямую из ZIP кейса")
     build.add_argument("--case-dir", required=True, type=Path)
     build.add_argument("--output", type=Path, default=DEFAULT_KB)
@@ -66,7 +67,8 @@ def parser() -> argparse.ArgumentParser:
     batch = sub.add_parser('batch', help='пакетный анализ папки/ZIP/TAR, по одному отчёту на объект')
     batch.add_argument('source', type=Path)
     batch.add_argument('--kb', type=Path, default=DEFAULT_KB)
-    batch.add_argument('--profile', choices=('fast', 'quality', 'deep'), default='quality')
+    batch.add_argument('--profile', choices=('fast', 'quality', 'deep', 'custom'), default='quality')
+    batch.add_argument('--options-file',type=Path,help='JSON переключателей компонентов и сетевых лимитов')
     batch.add_argument('--network', choices=('offline', 'http', 'browser'), default='offline')
     batch.add_argument('--confirm-browser-risk')
     batch.add_argument('--extensions', nargs='+')
@@ -76,10 +78,15 @@ def parser() -> argparse.ArgumentParser:
     batch.add_argument('--persist', action='store_true')
     sub.add_parser("setup-ocr", help="скачать и проверить локальные ONNX-модели русского OCR")
     sub.add_parser('setup-text-model', help='скачать закреплённый многоязычный классификатор; включается отдельно, только наблюдения')
+    sub.add_parser('setup-laya', help='скачать локальную Laya multilingual для оценки текста')
     logos = sub.add_parser('index-logos', help='индекс проверенных изображений брендов, manifest.jsonl в папке')
     logos.add_argument('gallery', type=Path)
+    import_logos = sub.add_parser('import-logos', help='добавить проверенные значки в локальную галерею без SigLIP')
+    import_logos.add_argument('gallery', type=Path)
     match_logo = sub.add_parser('match-logo', help='визуальные кандидаты бренда; не вердикт фишинга')
     match_logo.add_argument('image', type=Path)
+    match_logo.add_argument('--backend',choices=('local','siglip'),default='local')
+    match_logo.add_argument('--gallery',type=Path,help='Папка manifest.jsonl для локальных признаков изображения')
     feeds = sub.add_parser("update-feeds", help="скачать локальные снимки фишинговых URL")
     feeds.add_argument("--kb", type=Path, default=DEFAULT_KB)
     feeds.add_argument("--provider", choices=("phishing-database", "openphish", "phishtank"), action="append")
@@ -89,6 +96,7 @@ def parser() -> argparse.ArgumentParser:
     corpus.add_argument("archive", type=Path)
     corpus.add_argument("--profile", choices=("fast", "quality"), default="quality")
     corpus.add_argument("--max-items", type=int)
+    corpus.add_argument('--russian-only',action='store_true',help='отдельная оценка российских брендов; отбор указан в отчёте')
     corpus.add_argument("--output", type=Path)
     ingest = sub.add_parser("import-corpus", help="добавить связанные образцы из ZIP без автоматической блокировки их хешей")
     ingest.add_argument("archive", type=Path)
@@ -161,25 +169,54 @@ def doctor() -> dict:
     from .reputation import status
     from .kb import KnowledgeBase
     from .ocr import status as ocr_status
+    from .layamodel import status as laya_status
     return {
         "status": "OK" if all(checks.values()) else "DEGRADED",
         "python": sys.version, "platform": platform.platform(), "project_root": str(PROJECT_ROOT),
         "modules": checks, "edge": {"path": str(edge), "available": edge.exists()},
         "knowledge_base": {"path": str(DEFAULT_KB), "valid": kb_ok, "known_hashes": kb_rows},
         "reputation": status(KnowledgeBase(DEFAULT_KB).reputation_path), "ocr": ocr_status(), "deep": deep,
+        "laya": laya_status(),
         "privacy": "models and reputation are local; HTTP/browser modes visit message links; raw inputs are not persisted automatically",
     }
 
 
 def main(argv: list[str] | None = None) -> int:
+    if os.name=='nt':
+        # JSON and logs may contain Japanese brand names from customer captures.
+        # The legacy cp1251 pipe encoding must not crash a completed benchmark.
+        for stream in (sys.stdout,sys.stderr):
+            try:stream.reconfigure(encoding='utf-8',errors='backslashreplace')
+            except (AttributeError,ValueError,OSError):pass
     args = parser().parse_args(argv)
+    component_options=None
+    if getattr(args,'options_file',None):
+        try:
+            component_options=json.loads(args.options_file.read_text(encoding='utf-8'))
+            from .options import resolve
+            resolve(args.profile,component_options)
+        except (ValueError,OSError,TypeError) as exc:
+            print('Неверный файл настроек: '+str(exc),file=sys.stderr)
+            return 30
     if args.log_json:
         from .logging import configure
         configure()
+    if args.command=='import-logos':
+        from .logogallery import import_gallery
+        print(json.dumps(import_gallery(args.gallery),ensure_ascii=False,indent=2))
+        return 0
     if args.command in {'index-logos','match-logo'}:
         from .logos import build_index, match_image
-        result = build_index(args.gallery) if args.command == 'index-logos' else match_image(args.image.read_bytes())
+        if args.command=='index-logos':result=build_index(args.gallery)
+        elif args.backend=='siglip':result=match_image(args.image.read_bytes())
+        else:
+            from .visual import match_image as local_match
+            result=local_match(args.image.read_bytes(),gallery=args.gallery)
         print(json.dumps(result,ensure_ascii=False,indent=2))
+        return 0
+    if args.command == 'setup-laya':
+        from .layamodel import setup
+        print(json.dumps(setup(),ensure_ascii=False,indent=2))
         return 0
     if args.command == 'setup-text-model':
         from .textmodel import setup
@@ -215,7 +252,7 @@ def main(argv: list[str] | None = None) -> int:
         from .store import ReportStore
         from .config import REPORT_DIR
         try:
-            result = run_batch(args.source, Analyzer(args.kb), profile=args.profile, network=args.network, browser_confirmation=args.confirm_browser_risk, extensions=args.extensions, pattern=args.pattern, output=args.output, resume=args.resume, store=ReportStore(REPORT_DIR / 'history.sqlite') if args.persist else None, progress=lambda count, row: print(f"Processed {count}: {row['report']['analysis_status']}", file=sys.stderr) if count % 50 == 0 else None)
+            result = run_batch(args.source, Analyzer(args.kb), options=component_options, profile=args.profile, network=args.network, browser_confirmation=args.confirm_browser_risk, extensions=args.extensions, pattern=args.pattern, output=args.output, resume=args.resume, store=ReportStore(REPORT_DIR / 'history.sqlite') if args.persist else None, progress=lambda count, row: print(f"Processed {count}: {row['report']['analysis_status']}", file=sys.stderr) if count % 50 == 0 else None)
         except ValueError as exc:
             print(json.dumps({'batch_status':'FAILED','error':str(exc)},ensure_ascii=False))
             return 30
@@ -239,7 +276,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "benchmark-corpus":
         from .corpus import benchmark_corpus
-        result = benchmark_corpus(args.archive, max_items=args.max_items, output=args.output, profile=args.profile, progress=lambda done: print(f"Corpus: {done}", file=sys.stderr))
+        result = benchmark_corpus(args.archive, max_items=args.max_items, output=args.output, profile=args.profile, russian_only=args.russian_only, progress=lambda done: print(f"Corpus: {done}", file=sys.stderr))
         print(json.dumps({k:v for k,v in result.items() if k != "rows"}, ensure_ascii=False, indent=2))
         return 0
     if args.command in {"update-feeds", "feed-status"}:
@@ -261,12 +298,12 @@ def main(argv: list[str] | None = None) -> int:
         source = sys.stdin.buffer.read(DEFAULT_LIMITS.max_input_bytes + 1) if args.source == "-" else args.source
         from .utils import pasted_name
         name = pasted_name(source,"stdin") if isinstance(source,bytes) else None
-        report = Analyzer(args.kb).analyze(source, name=name, profile=args.profile, network=args.network, browser_confirmation=args.confirm_browser_risk)
+        report = Analyzer(args.kb).analyze(source, name=name, options=component_options, profile=args.profile, network=args.network, browser_confirmation=args.confirm_browser_risk)
         payload = report.to_dict()
         if args.persist:
             from .store import ReportStore
             from .config import REPORT_DIR
-            payload['report_id'] = ReportStore(REPORT_DIR/'history.sqlite').put(payload)
+            payload['report_id'] = ReportStore(REPORT_DIR/'history.sqlite').put(report)
         if args.output:
             args.output.parent.mkdir(parents=True, exist_ok=True)
             args.output.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -276,11 +313,11 @@ def main(argv: list[str] | None = None) -> int:
             _print_human(report)
         return 30 if report.analysis_status.value == "FAILED" else EXIT_CODES[report.verdict]
     if args.command == "gui":
-        from .gui import run_gui
-        if not DEFAULT_KB.exists():
-            initialize_empty_kb()
-            export_runtime_artifacts()
-        run_gui()
+        if importlib.util.find_spec('fastapi') is None or importlib.util.find_spec('uvicorn') is None:
+            print('Веб-интерфейсу нужны зависимости API: python -m pip install -e ".[api]"',file=sys.stderr)
+            return 30
+        from .api import main as serve_gui
+        serve_gui(open_browser=True)
         return 0
     if args.command == "build-kb":
         result = build_case_kb(args.case_dir, args.output, progress=lambda done, total: print(f"Indexed {done}/{total}", file=sys.stderr))

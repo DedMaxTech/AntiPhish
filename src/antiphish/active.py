@@ -35,7 +35,8 @@ def script_facts(code: str, source: str) -> dict:
         'dynamic_code': r'(?i)(?:\beval\s*\(|ExecuteGlobal|\bExecute\b|\batob\s*\(|fromCharCode)',
     }
     found = [name for name, pattern in features.items() if re.search(pattern, decoded)]
-    return {'source': source, 'sha256': hashlib.sha256(code.encode('utf-8', 'replace')).hexdigest(), 'characters': len(code), 'features': found, 'urls': list(dict.fromkeys(urls)), 'executed': False}
+    from .contexts import redact
+    return {'source': source, 'sha256': hashlib.sha256(code.encode('utf-8', 'replace')).hexdigest(), 'characters': len(code), 'features': found, 'urls': list(dict.fromkeys(urls)), 'executed': False, 'code_excerpt':redact(code,1600)}
 
 
 def pdf_actions(doc, limits) -> tuple[list[dict], list[str], list[str]]:

@@ -32,23 +32,74 @@ def _load(path: str):
     return tokenizer, model
 
 
-def score(text: str, path: Path = DEFAULT_PATH) -> dict:
+def text_windows(text, tokenizer, *, max_tokens=384, max_windows=6):
+    """Keep the beginning, end and distributed middle; bound adversarial inputs.
+
+    The model was trained on short messages. Long emails must not silently lose
+    their CTA, nor should arbitrary-length messages produce unlimited inference.
+    """
+    capacity = max_tokens - tokenizer.num_special_tokens_to_add(pair=False)
+    # Character cap bounds tokenization too. Preserve both ends before tokenizing.
+    bounded = text if len(text) <= 48000 else text[:24000] + '\n' + text[-24000:]
+    ids = tokenizer(bounded, add_special_tokens=False, truncation=False)['input_ids']
+    if len(ids) <= capacity:
+        return [ids], [(0, len(ids))], len(ids), len(text)>48000
+    stride = max(1, capacity - 96)
+    starts = list(range(0, max(1, len(ids)-capacity+1), stride))
+    if starts[-1] != len(ids)-capacity:
+        starts.append(len(ids)-capacity)
+    if max_windows<1:raise ValueError('At least one text window is required')
+    if len(starts) > max_windows:
+        starts = [starts[0]] if max_windows==1 else [starts[round(i*(len(starts)-1)/(max_windows-1))] for i in range(max_windows)]
+    spans = [(s, min(len(ids), s+capacity)) for s in starts]
+    covered = set(i for a,b in spans for i in range(a,b))
+    return [ids[a:b] for a,b in spans], spans, len(ids), len(covered)<len(ids) or len(text)>48000
+
+
+def score(text: str, path: Path = DEFAULT_PATH, *, head_only=False) -> dict:
     import torch
     started = time.perf_counter()
     tokenizer, model = _load(str(path))
-    inputs = tokenizer(text, return_tensors='pt', truncation=True, max_length=384).to(model.device)
-    with torch.inference_mode():
-        values = torch.softmax(model(**inputs).logits.float(), dim=-1)[0]
+    windows, spans, tokens, limited = text_windows(text, tokenizer, max_windows=6)
+    if head_only:
+        windows, spans = windows[:1], spans[:1]
+    # Public batch API works with both Transformers 4 tokenizers and the v5
+    # TokenizersBackend (which no longer exposes prepare_for_model).
+    fragments = [text if i == 0 and len(text)<=48000 else tokenizer.decode(ids, skip_special_tokens=True, clean_up_tokenization_spaces=False) for i,ids in enumerate(windows)]
+    results = []
+    # Small batches avoid temporary eager-attention allocations on CPU/GPU.
+    for offset in range(0, len(fragments), 2):
+        inputs = tokenizer(fragments[offset:offset+2], padding=True, truncation=True, max_length=384, return_tensors='pt').to(model.device)
+        with torch.inference_mode():
+            results.append(torch.softmax(model(**inputs).logits.float(), dim=-1).cpu())
+    values = torch.cat(results)
     if not torch.isfinite(values).all():
         raise ValueError('Non-finite classifier scores')
-    scores = {model.config.id2label[i].lower(): round(float(value), 6) for i, value in enumerate(values.cpu())}
+    labels = [model.config.id2label[i].lower() for i in range(values.shape[-1])]
+    if not {'fraud', 'spam', 'legitimate'} <= set(labels):
+        raise ValueError('Unexpected classifier label mapping')
+    selected = int(values[:,labels.index('fraud')].argmax())
+    scores = {label: round(float(value), 6) for label, value in zip(labels,values[selected])}
     if not {'fraud', 'spam', 'legitimate'} <= scores.keys():
         raise ValueError('Unexpected classifier label mapping')
-    return {'model': REPOSITORY, 'revision': REVISION, 'scores': scores, 'input_characters': len(text), 'max_tokens': 384, 'suspicious': False, 'blocking': False, 'calibrated_on_russian_mail': False, 'runtime_ms': round((time.perf_counter()-started)*1000,2)}
+    evidence = tokenizer.decode(windows[selected], skip_special_tokens=True)
+    from .contexts import redact
+    return {'model': REPOSITORY, 'revision': REVISION, 'scores': scores,
+            'input_characters': len(text), 'input_tokens':tokens, 'max_tokens': 384,
+            'windows':len(windows), 'coverage_limited':limited,
+            'evidence_is_full_text':len(windows)==1 and not limited,
+            'aggregation':'highest-fraud-window; not a calibrated document probability',
+            'selected_window':selected, 'selected_token_span':list(spans[selected]),
+            'evidence_text':redact(evidence,1800),
+            'window_scores':[{label:round(float(v),6) for label,v in zip(labels,row)} for row in values],
+            'suspicious': False, 'blocking': False, 'calibrated_on_russian_mail': False,
+            'runtime_ms': round((time.perf_counter()-started)*1000,2)}
 
 
-def configured_score(text: str):
-    value = os.environ.get('ANTIPHISH_TEXT_MODEL_DIR')
+def configured_score(text: str, *, force=False):
+    if not text.strip():
+        return [{'model':REPOSITORY,'status':'NO_TEXT','note':'Нет извлечённого текста.','suspicious':False,'blocking':False}],[]
+    value = os.environ.get('ANTIPHISH_TEXT_MODEL_DIR') or (str(DEFAULT_PATH) if force else None)
     if not value:
         return [], []
     try:

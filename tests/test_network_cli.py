@@ -67,7 +67,10 @@ def test_network_candidate_selection_ignores_assets_but_keeps_distinct_paths(emp
       <a href='https://account.example.org/check'>Open account</a>
       </body></html>"""
     report = Analyzer(empty_kb).analyze(body, name="newsletter.html", network="http")
-    assert calls == ["https://www.twitch.tv/r/e/campaign-one", "https://www.twitch.tv/r/e/campaign-two", "https://account.example.org/check"]
+    # A passive image may be fetched for the static render. It is not a
+    # navigation candidate and does not cause CSS/JS/favicon traversal.
+    assert calls == ["https://static-cdn.example/banner.png", "https://www.twitch.tv/r/e/campaign-one", "https://account.example.org/check", "https://www.twitch.tv/r/e/campaign-two"]
+    assert not any('/banner.png' in r.get('url','') for r in report.routes)
     assert report.configuration["network_urls_total"] == 7
     assert report.configuration["network_candidates"] == 3
     assert report.configuration["network_ignored_resources"] == 4

@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>AntiPhish - проверка писем</title>
+<link rel="stylesheet" href="/assets/style.css?v=2.8"><script defer src="/assets/model_views.js?v=2.8"></script><script defer src="/assets/app.js?v=2.8"></script><script defer src="/assets/components.js?v=2.8"></script>
+</head>
+<body>
+<header><a class="brand" href="/">AntiPhish</a><nav aria-label="Разделы"><button data-view="analysis" class="active">Проверка</button><button data-view="history">История</button><button data-view="knowledge">База образцов</button></nav><a href="/docs" target="_blank" rel="noopener">API</a></header>
+<main>
+<div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
+<section id="view-analysis">
+<div class="page-heading"><div><h1>Проверка письма</h1><p class="muted">Загрузите файл или укажите ссылку</p></div></div>
+<form id="analysis-form" class="panel">
+<div class="fields">
+<label class="file-field">Файл или архив<input id="file" type="file" accept=".eml,.html,.htm,.pdf,.doc,.docx,.docm,.xls,.xlsx,.xlsm,.ppt,.pptx,.pptm,.png,.jpg,.jpeg,.svg,.zip,.tar,.gz"><span class="file-hint small muted">Можно перетащить файл сюда</span></label>
+<label>Либо URL / путь на сервере<input id="source" type="text" placeholder="https://... или путь к файлу / папке" autocomplete="off"></label>
+</div>
+<div class="fields settings">
+<label>Профиль<select id="profile"><option value="fast">Fast - без OCR и QR</option><option value="quality" selected>Quality - OCR, QR, вложения</option><option value="deep">Deep - дополнительно модели</option><option value="custom">Свой набор компонентов</option></select></label>
+<label>Сеть<select id="network"><option value="offline">Offline - без посещения сайтов</option><option value="http" selected>HTTP - загрузка страниц без JavaScript</option><option value="browser">Browser - JavaScript и проверка форм</option></select></label>
+</div>
+<details class="component-settings"><summary>Компоненты и лимиты</summary>
+
+<div class="component-grid">
+<fieldset><legend>Извлечение</legend><label class="check"><input type="checkbox" data-component="ocr" checked> Текст на изображениях (OCR)</label><label class="check"><input type="checkbox" data-component="qr" checked> QR-коды</label><label class="check"><input type="checkbox" data-component="render_local" checked> Отрисовка писем и страниц</label></fieldset>
+<fieldset><legend>Модели</legend><label class="check"><input type="checkbox" data-component="visual_brands"> Поиск логотипов</label><label class="check"><input type="checkbox" data-component="laya"> Анализ текста (Laya)</label><label class="check"><input type="checkbox" data-component="llm"> Анализ содержимого (Qwen)</label><label class="check"><input type="checkbox" data-component="text_model"> Классификатор текста (Horizon)</label><label class="check"><input type="checkbox" data-component="siglip"> SigLIP: названия брендов</label><label class="check"><input type="checkbox" data-component="logo_references"> SigLIP: изображения эталонов</label></fieldset>
+<fieldset><legend>База знаний</legend><label class="check"><input type="checkbox" data-component="hash_samples" checked> Отпечатки файлов</label><label class="check"><input type="checkbox" data-component="url_iocs" checked> Ручные URL-индикаторы</label><label class="check"><input type="checkbox" data-component="reputation" checked> Локальные репутационные списки</label><div class="feed-switches"><label class="check"><input type="checkbox" data-component="feed_phishing_database" checked> Phishing.Database</label><label class="check"><input type="checkbox" data-component="feed_openphish" checked> OpenPhish</label><label class="check"><input type="checkbox" data-component="feed_phishtank" checked> PhishTank </label></div><label class="check"><input type="checkbox" data-component="templates" checked> Отпечатки страниц / форм</label><label class="check"><input type="checkbox" data-component="reviewed_samples" checked> Размеченные письма и файлы</label></fieldset></div>
+<div class="fields limits"><label>Страниц по ссылкам<input id="limit-pages" type="number" min="1" max="30" value="12"></label><label>Глубина переходов<input id="limit-depth" type="number" min="0" max="10" value="4"></label><label>Сетевой бюджет, секунд<input id="limit-seconds" type="number" min="5" max="180" value="45"></label></div>
+<p class="small muted">Для моделей нужны локальные веса. Настройки сохраняются.</p></details>
+<label class="check"><input id="batch-mode" type="checkbox"> Пакетная обработка папки или архива</label>
+<label id="browser-confirm" class="check warning" hidden><input id="browser-risk" type="checkbox"> Разрешить переходы по ссылкам в отдельном браузере</label>
+<div class="actions"><button id="run" type="submit" class="primary">Проверить</button><span id="progress" class="muted" aria-live="polite"></span></div>
+<p class="muted small">До 50 МиБ. Отчёты сохраняются локально.</p>
+</form>
+<div id="batch-result"></div><div id="result"></div>
+</section>
+<section id="view-history" hidden><div class="section-head"><h1>История проверок</h1><button id="refresh-history">Обновить</button></div><div id="history-list"></div></section>
+<section id="view-knowledge" hidden><div class="section-head"><h1>База образцов</h1><button id="refresh-knowledge">Обновить</button></div><div id="knowledge-status" class="panel"></div><div class="section-head"><h2>Репутационные списки</h2><button id="update-feeds">Обновить списки из интернета</button></div><div id="feeds"></div>
+<details class="panel"><summary>Добавить файл в базу</summary><form id="kb-import-form"><div class="fields"><label>Письмо, HTML, документ или картинка<input id="kb-import-file" type="file" required></label><label>Метка<select id="kb-import-label"><option value="phishing">Фишинговый</option><option value="benign">Легитимный</option></select></label></div><label>Комментарий<input id="kb-import-comment" type="text" maxlength="2000"></label><label class="check"><input id="kb-import-forms" type="checkbox"> Сохранить также эталоны найденных форм</label><button type="submit">Добавить образец</button><span id="kb-import-status" class="small muted"></span></form></details>
+<div class="kb-tabs" role="group" aria-label="Тип записей"><button data-kb-kind="reviews" class="active">Письма и файлы</button><button data-kb-kind="templates">Страницы и формы</button><button data-kb-kind="hashes">Отпечатки файлов</button><button data-kb-kind="iocs">URL-индикаторы</button></div>
+<div id="samples"></div>
+<div id="kb-browser" hidden><p id="kb-description" class="small muted"></p><form id="kb-search-form" class="search-row"><input id="kb-query" type="text" placeholder="Поиск по бренду, источнику, метке или SHA256"><button type="submit">Найти</button><button id="kb-undo" type="button" hidden>Отменить изменение</button></form>
+<form id="kb-add-form" class="panel" hidden><h3>Добавить подтверждённый индикатор</h3><p class="small muted">Совпадение с индикатором даёт PHISHING.</p><div class="fields"><label>SHA256 или полный URL<input id="kb-add-value" type="text" required></label><label>Основание / источник<input id="kb-add-source" type="text" value="Добавлено вручную" required></label></div><button type="submit">Добавить индикатор</button></form><div id="kb-list"></div><div class="pager"><button id="kb-prev">Назад</button><span id="kb-range"></span><button id="kb-next">Далее</button></div></div></section>
+</main>
+</body></html>
+

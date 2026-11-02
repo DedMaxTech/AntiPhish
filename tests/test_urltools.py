@@ -38,3 +38,11 @@ def test_public_suffix_offline():
 
 def test_ipv6_host_keeps_brackets():
     assert normalize_url("https://[2606:4700:4700::1111]/x").normalized.startswith("https://[")
+
+
+def test_official_regional_and_ad_wrappers_but_not_lookalikes():
+    from antiphish.urltools import unwrap_url
+    assert unwrap_url('https://www.google.rs/url?q=https%3A%2F%2Ftarget.example%2Flogin') == 'https://target.example/login'
+    assert unwrap_url('https://googleads.g.doubleclick.net/pcs/click?adurl=https%3A%2F%2Ftarget.example%2Flogin') == 'https://target.example/login'
+    assert unwrap_url('https://google.rs.evil.example/url?q=https%3A%2F%2Ftarget.example%2Flogin') is None
+    assert unwrap_url('https://google.example/url?q=https%3A%2F%2Ftarget.example%2Flogin') is None

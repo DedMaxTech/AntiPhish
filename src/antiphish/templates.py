@@ -23,10 +23,10 @@ def signature(page, fingerprints):
     words = re.findall(r"[^\W\d_]{3,}", page.text.casefold(), re.UNICODE)
     shingles = [" ".join(words[i:i+3]) for i in range(max(0,len(words)-2))]
     types = sorted({t for f in page.forms for t in f.sensitive_types})
-    return fingerprints.get("dom_simhash64"), simhash64(shingles), json.dumps(types)
+    return page.dom_signature or fingerprints.get("dom_simhash64"), simhash64(shingles), json.dumps(types)
 
 
-def import_corpus(path: Path, kb_path: Path, progress=None):
+def import_corpus(path: Path, kb_path: Path, progress=None, *, refresh_only=False):
     from .corpus import read_corpus
     from .extractors import extract_html
     from .config import DEFAULT_LIMITS
@@ -41,7 +41,11 @@ def import_corpus(path: Path, kb_path: Path, progress=None):
                 parsed = extract_html(capture.body, DEFAULT_LIMITS, capture.final_url)
                 for page in parsed.pages:
                     dom, text, types = signature(page, parsed.fingerprints)
-                    con.execute("INSERT OR REPLACE INTO behavior_templates VALUES(?,?,?,?,?,?,?,?)", (page.sha256, path.name+":"+sample.id+":"+hashlib.sha256(key.encode()).hexdigest()[:12], canonical_brand, dom, text, types, "provider-phishing-unreviewed", "recorded-page; may include legitimate landing or error pages"))
+                    source=path.name+":"+sample.id+":"+hashlib.sha256(key.encode()).hexdigest()[:12]
+                    if refresh_only:
+                        con.execute('UPDATE behavior_templates SET dom_simhash=?,text_simhash=?,sensitive_types=? WHERE sha256=? AND source_id=?',(dom,text,types,page.sha256,source))
+                    else:
+                        con.execute("INSERT INTO behavior_templates VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(sha256,source_id) DO UPDATE SET dom_simhash=excluded.dom_simhash,text_simhash=excluded.text_simhash,sensitive_types=excluded.sensitive_types", (page.sha256,source,canonical_brand,dom,text,types,"provider-phishing-unreviewed","recorded-page; may include legitimate landing or error pages"))
                     records += 1
             if progress and mails % 50 == 0:
                 progress(mails)
@@ -87,13 +91,20 @@ def match_pages(report, kb_path: Path):
                 return
             hits, benign = [], False
             for source, brand, d, t, label in candidates:
-                distance_dom = (int(dom,16)^int(d,16)).bit_count()
+                if d.startswith('v2:'):
+                    if not dom.startswith('v2:'):continue
+                    current_dom,known_dom=dom[3:],d[3:];version=2
+                else:
+                    current_dom=page.legacy_dom_signature or (dom if not dom.startswith('v2:') else None)
+                    if current_dom is None:continue
+                    known_dom=d;version=1
+                distance_dom = (int(current_dom,16)^int(known_dom,16)).bit_count()
                 distance_text = (int(text,16)^int(t,16)).bit_count()
                 if distance_dom > 3 or distance_text > 4:
                     continue
                 if label == "benign":
                     benign = True
                 elif label == "phishing" or brand in page.claimed_brands:
-                    hits.append({"source":source,"brand":brand,"dom_distance":distance_dom,"text_distance":distance_text,"label":label})
+                    hits.append({"source":source,"brand":brand,"dom_distance":distance_dom,"text_distance":distance_text,"label":label,'dom_version':version})
             if hits and not benign:
                 report.reason_codes.append(Evidence("CAMPAIGN_TEMPLATE_MATCH",Severity.MEDIUM,"Форма и текст близки к образцу фишинговой кампании",{"matches":hits[:3],"blocking":False},independent_group="similarity",scope_id=page.id))

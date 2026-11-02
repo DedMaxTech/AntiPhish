@@ -17,6 +17,25 @@ from .config import Limits
 from .urltools import is_public_host, normalize_url, resolve_redirect
 
 
+def tls_context():
+    """Retain normal TLS validation; allow an operator-approved extra CA file.
+
+    No certificates are downloaded from the inspected site and no global trust
+    store is changed. This supports national/corporate roots on an isolated stand.
+    """
+    context=ssl.create_default_context()
+    import certifi
+    # Windows' lazily populated root cache can be incomplete for OpenSSL even
+    # when Schannel/browser validation succeeds. Augment it with Mozilla roots.
+    context.load_verify_locations(cafile=certifi.where())
+    extra=os.environ.get('ANTIPHISH_CA_BUNDLE')
+    if extra:
+        path=Path(extra)
+        if not path.is_file():raise ValueError('ANTIPHISH_CA_BUNDLE file not found')
+        context.load_verify_locations(cafile=str(path))
+    return context
+
+
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
@@ -48,7 +67,7 @@ class PinnedHTTPSConnection(PinnedHTTPConnection):
 
     def __init__(self, host, *, addresses, context=None, check_hostname=None, **kwargs):
         super().__init__(host, addresses=addresses, **kwargs)
-        self.context = context or ssl.create_default_context()
+        self.context = context or tls_context()
 
     def connect(self):
         super().connect()
@@ -68,7 +87,7 @@ class PinnedHTTPHandler(urllib.request.HTTPHandler):
 
 class PinnedHTTPSHandler(urllib.request.HTTPSHandler):
     def __init__(self, addresses):
-        super().__init__(context=ssl.create_default_context())
+        super().__init__(context=tls_context())
         self.addresses = addresses
 
     def https_open(self, request):
@@ -87,6 +106,9 @@ class FetchResult:
     charset: str | None = None
     interactions: list[dict] = field(default_factory=list)
     screenshot: bytes = field(default=b"", repr=False)
+    visual_exclusions: list = field(default_factory=list,repr=False)
+    document_from: str | None = None
+    resource_observations: list = field(default_factory=list)
 
 
 class _BrowserDeadline:
@@ -193,6 +215,19 @@ def browser_executable() -> str | None:
     return str(edge) if os.name == 'nt' and edge.exists() else None
 
 
+def settle_visual_content(page,deadline):
+    """Wait for actual visual resources before the form probe locks traffic."""
+    budget=min(3.,max(0.,deadline-time.monotonic()-.8))
+    if budget<=0:return
+    page.evaluate('''ms => Promise.race([
+      Promise.all(Array.from(document.images,i=>i.decode().catch(()=>null))),
+      new Promise(r=>setTimeout(r,ms))])''',int(budget*1000))
+    # Child frames and short client-side layout tasks can finish after the
+    # main document's DOMContentLoaded. Do not wait for analytics network-idle.
+    remaining=min(.4,max(0.,deadline-time.monotonic()-.8))
+    if remaining:page.wait_for_timeout(int(remaining*1000))
+
+
 def safe_browser_get(url: str, limits: Limits, confirmation: str | None) -> FetchResult:
     if confirmation != "I_UNDERSTAND":
         raise ValueError("browser mode requires --confirm-browser-risk I_UNDERSTAND")
@@ -207,13 +242,25 @@ def safe_browser_get(url: str, limits: Limits, confirmation: str | None) -> Fetc
     # Start at the URL resolved by the pinned transport. A synthetic browser
     # 302 can bypass Playwright interception for the redirected request.
     initial = safe_http_get(target.normalized, limits)
+    document_from=None
+    if 'html' in initial.content_type:
+        from .extractors import _decode_html
+        from .navigation import published_sheet_targets
+        sheets=published_sheet_targets(_decode_html(initial.body,initial.charset),initial.final_url)
+        if sheets:
+            document_from=initial.final_url
+            remaining=max(.1,limits.max_network_seconds-(time.monotonic()-started))
+            sheet=safe_http_get(sheets[0],replace(limits,network_timeout_seconds=min(remaining,limits.network_timeout_seconds)))
+            sheet.chain=list(dict.fromkeys(initial.chain+sheet.chain))
+            sheet.navigation_chain=list(dict.fromkeys((initial.navigation_chain or [initial.final_url])+(sheet.navigation_chain or [sheet.final_url])))
+            initial=sheet
     if initial.content_type not in {'text/html', 'application/xhtml+xml'}:
         # Documents are handled by their bounded static parser, rather than
         # mistaking a browser's own PDF viewer for the attacker's login form.
         return initial
     with sync_playwright() as pw, _BrowserDeadline(pw, limits.max_network_seconds-(time.monotonic()-started)):
         browser = pw.chromium.launch(executable_path=browser_executable(), headless=True, args=["--disable-extensions", "--disable-sync", "--disable-background-networking", "--force-webrtc-ip-handling-policy=disable_non_proxied_udp"])
-        context = browser.new_context(service_workers="block", accept_downloads=False)
+        context = browser.new_context(service_workers="block", accept_downloads=False,viewport={'width':1280,'height':900})
         context.set_default_timeout(1500)
         context.add_init_script("for(const key of ['RTCPeerConnection','webkitRTCPeerConnection']){try{Object.defineProperty(globalThis,key,{value:undefined,writable:false,configurable:false})}catch(e){}}")
         page = context.new_page()
@@ -228,6 +275,7 @@ def safe_browser_get(url: str, limits: Limits, confirmation: str | None) -> Fetc
         probe_active = False
         probe_markers, probe_identity, probe_origin, probe_form = {}, "", "", ""
         interactions = []
+        resource_observations=[]
 
         def abort(route, message=None):
             if message and message not in warnings:
@@ -259,6 +307,15 @@ def safe_browser_get(url: str, limits: Limits, confirmation: str | None) -> Fetc
                 abort(route)
                 return
             if request.resource_type in {"websocket", "eventsource", "media", "font"}:
+                abort(route)
+                return
+            from .navigation import service_reason
+            from .models import UrlFinding
+            try:request_url=normalize_url(request.url)
+            except ValueError:
+                abort(route);return
+            service=service_reason(UrlFinding(request_url.redacted,normalized=request_url.redacted,host=request_url.host))
+            if service and (not request.is_navigation_request() or request.frame!=page.main_frame):
                 abort(route)
                 return
             try:
@@ -293,7 +350,8 @@ def safe_browser_get(url: str, limits: Limits, confirmation: str | None) -> Fetc
                     ctype = fetched.content_type + "; charset=utf-8"
                 route.fulfill(status=int(fetched.status), body=rendered_body, content_type=ctype)
             except Exception as exc:
-                abort(route, "Browser GET failed: " + type(exc).__name__)
+                if len(resource_observations)<30:resource_observations.append({'url':request_url.redacted,'kind':request.resource_type,'status':'FAILED','error':type(exc).__name__,'http_status':getattr(exc,'code',None)})
+                abort(route, request_url.host+": "+request.resource_type+" - "+type(exc).__name__)
                 return
 
         context.route("**/*", route_handler)
@@ -312,7 +370,7 @@ def safe_browser_get(url: str, limits: Limits, confirmation: str | None) -> Fetc
                 response = page.goto(destination, wait_until="domcontentloaded", timeout=int(min(remaining,limits.network_timeout_seconds) * 1000))
                 if response is None:
                     raise ValueError("Browser navigation did not produce a response")
-                page.wait_for_timeout(min(750,max(1,int(remaining * 1000))))
+                settle_visual_content(page,started+limits.max_network_seconds)
                 if pending_navigation is None:
                     break
                 destination = pending_navigation
@@ -323,6 +381,7 @@ def safe_browser_get(url: str, limits: Limits, confirmation: str | None) -> Fetc
             navigation_chain.append(final.normalized)
             body = page.content().encode("utf-8")
             screenshot = b""
+            exclusions=[]
             # Enforce the traffic lock BEFORE touching any input. Scripts may
             # react to fill(), without waiting for the submit button.
             probe_active = True
@@ -338,6 +397,11 @@ def safe_browser_get(url: str, limits: Limits, confirmation: str | None) -> Fetc
                     screenshot = page.screenshot(type="png", timeout=1500, animations="disabled")
             except Exception as exc:
                 warnings.append("Client-side form probing incomplete: " + type(exc).__name__)
+            if time.monotonic()-started<limits.max_network_seconds:
+                try:
+                    from .localrender import visual_exclusions as get_exclusions
+                    exclusions=get_exclusions(page)
+                except Exception:pass
             if len(body) > limits.max_http_bytes:
                 raise ValueError("Browser DOM exceeds configured byte limit")
             status = str(response.status)
@@ -354,4 +418,4 @@ def safe_browser_get(url: str, limits: Limits, confirmation: str | None) -> Fetc
                 browser.close()
             except Exception:
                 pass
-    return FetchResult(body=body, final_url=final.normalized, chain=list(dict.fromkeys(chain)), content_type="text/html", status=status,navigation_chain=list(dict.fromkeys(navigation_chain)),warnings=warnings,charset="utf-8",interactions=interactions,screenshot=screenshot)
+    return FetchResult(body=body, final_url=final.normalized, chain=list(dict.fromkeys(chain)), content_type="text/html", status=status,navigation_chain=list(dict.fromkeys(navigation_chain)),warnings=warnings,charset="utf-8",interactions=interactions,screenshot=screenshot,visual_exclusions=exclusions,document_from=document_from,resource_observations=resource_observations)

@@ -80,7 +80,7 @@ class KnowledgeBase:
         con = self.connect()
         try:
             row = con.execute(
-                "SELECT sha256,object_type,verdict,source,expires_at,provenance FROM known_hashes WHERE sha256=? AND (expires_at IS NULL OR expires_at>=?) AND object_type NOT IN ('png','image','screenshot')",
+                "SELECT sha256,object_type,verdict,source,expires_at,provenance FROM known_hashes WHERE sha256=? AND (expires_at IS NULL OR expires_at>=?) AND (object_type NOT IN ('png','image','screenshot') OR provenance='user-confirmed')",
                 (digest, time.strftime("%Y-%m-%d")),
             ).fetchone()
         finally:
